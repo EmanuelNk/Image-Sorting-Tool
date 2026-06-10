@@ -1,0 +1,4 @@
+PyQt6>=6.4.0
+Pillow>=10.0.0
+pillow-heif>=0.13.0
+# rawpy>=0.18.0  # Optional: RAW support — requires: brew install libraw
