@@ -17,6 +17,7 @@ _LABEL_H = 26
 _PATH_ROLE = Qt.ItemDataRole.UserRole
 _META_ROLE = Qt.ItemDataRole.UserRole + 1
 _PIXMAP_ROLE = Qt.ItemDataRole.UserRole + 2
+_SUBFOLDER_ROLE = Qt.ItemDataRole.UserRole + 3
 
 _COLOR_MAP = {
     "red":    QColor(192, 57, 43),
@@ -129,6 +130,21 @@ class _GridDelegate(QStyledItemDelegate):
                              bottom_r.bottom() - 4,
                              "P" if flag == "pick" else "✕")
 
+        # Subfolder banner
+        subfolder = index.data(_SUBFOLDER_ROLE) or ""
+        if subfolder:
+            banner_h = max(14, star_pt + 6)
+            banner_r = QRect(thumb_r.x(), thumb_r.bottom() - banner_h - 4,
+                             thumb_r.width(), banner_h)
+            painter.fillRect(banner_r, QColor(0, 0, 0, 160))
+            sf_font = QFont()
+            sf_font.setPointSize(max(6, star_pt - 1))
+            painter.setFont(sf_font)
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(banner_r.adjusted(3, 0, -2, 0),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             subfolder)
+
         painter.restore()
 
 
@@ -197,18 +213,21 @@ class GridViewWidget(QListWidget):
 
     # ── population ────────────────────────────────────────────────────────────
 
-    def load_images(self, paths: List[Path], metadata: MetadataStore):
+    def load_images(self, paths: List[Path], metadata: MetadataStore,
+                    root: Optional[Path] = None):
         self.blockSignals(True)
         self.clear()
         self._path_to_row.clear()
 
         hint = QSize(self._thumb_size + 6, self._thumb_size + _LABEL_H + 6)
         for i, path in enumerate(paths):
+            subfolder = path.parent.name if (root and path.parent != root) else ""
             item = QListWidgetItem()
             item.setSizeHint(hint)
             item.setData(_PATH_ROLE, str(path))
-            item.setData(_META_ROLE, metadata.get(path.name))
+            item.setData(_META_ROLE, metadata.get(path))
             item.setData(_PIXMAP_ROLE, None)
+            item.setData(_SUBFOLDER_ROLE, subfolder)
             self.addItem(item)
             self._path_to_row[str(path)] = i
 
@@ -224,7 +243,7 @@ class GridViewWidget(QListWidget):
         if row is not None:
             item = self.item(row)
             if item:
-                item.setData(_META_ROLE, metadata.get(path.name))
+                item.setData(_META_ROLE, metadata.get(path))
                 self.update(self.indexFromItem(item))
 
     # ── selection helpers (mirror filmstrip API) ──────────────────────────────

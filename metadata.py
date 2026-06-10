@@ -8,6 +8,9 @@ XMP fields:
   xmp:Rating      0-5 stars; -1 = rejected (Lightroom convention)
   xmp:Label       "Red" | "Yellow" | "Green" | "Blue" | "Purple"
   lr:pickStatus   1 = pick | -1 = reject | 0 = unflagged
+
+API now uses Path objects; cache keyed by str(path).
+load_folder() only does JSON migration — does NOT clear the cache.
 """
 import json
 import os
@@ -35,91 +38,90 @@ _XMP_SIG   = b"http://ns.adobe.com/xap/1.0/\x00"
 
 class MetadataStore:
     def __init__(self):
-        self._folder: Optional[Path] = None
         self._cache: Dict[str, dict] = {}
 
     def load_folder(self, folder: Path):
-        self._folder = folder
-        self._cache = {}
+        """Only runs JSON migration. Does NOT clear the cache."""
         self._migrate_json(folder)
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def get(self, filename: str) -> dict:
-        if filename not in self._cache:
-            self._cache[filename] = self._read(filename)
-        return dict(self._cache[filename])
+    def get(self, path: Path) -> dict:
+        key = str(path)
+        if key not in self._cache:
+            self._cache[key] = self._read(path)
+        return dict(self._cache[key])
 
-    def get_rating(self, filename: str) -> int:
-        return self.get(filename).get("rating", 0)
+    def get_rating(self, path: Path) -> int:
+        return self.get(path).get("rating", 0)
 
-    def get_color_label(self, filename: str) -> Optional[str]:
-        return self.get(filename).get("color_label")
+    def get_color_label(self, path: Path) -> Optional[str]:
+        return self.get(path).get("color_label")
 
-    def get_flag(self, filename: str) -> str:
-        return self.get(filename).get("flag", "unflagged")
+    def get_flag(self, path: Path) -> str:
+        return self.get(path).get("flag", "unflagged")
 
-    def set_rating(self, filename: str, rating: int):
-        entry = self.get(filename)
+    def set_rating(self, path: Path, rating: int):
+        entry = self.get(path)
         entry["rating"] = max(0, min(5, rating))
-        self._update(filename, entry)
+        self._update(path, entry)
 
-    def set_color_label(self, filename: str, color: Optional[str]):
-        entry = self.get(filename)
+    def set_color_label(self, path: Path, color: Optional[str]):
+        entry = self.get(path)
         entry["color_label"] = color
-        self._update(filename, entry)
+        self._update(path, entry)
 
-    def set_flag(self, filename: str, flag: str):
-        entry = self.get(filename)
+    def set_flag(self, path: Path, flag: str):
+        entry = self.get(path)
         entry["flag"] = flag
-        self._update(filename, entry)
+        self._update(path, entry)
 
-    def remove(self, filename: str):
-        """Clear metadata when an image is moved out of this folder."""
-        self._cache.pop(filename, None)
+    def remove(self, path: Path):
+        """Clear metadata when an image is moved out of its folder."""
+        key = str(path)
+        self._cache.pop(key, None)
         # Remove sidecar if one exists
-        xmp = self._sidecar_path(filename)
+        xmp = self._sidecar_path(path)
         try:
             if xmp.exists():
                 xmp.unlink()
         except OSError:
             pass
 
-    def import_entry(self, filename: str, entry: dict):
-        """Copy a full metadata dict into this folder (used on image move)."""
-        self._update(filename, entry)
+    def import_entry(self, path: Path, entry: dict):
+        """Copy a full metadata dict into this store (used on image move/copy)."""
+        self._update(path, entry)
 
     # ── routing ───────────────────────────────────────────────────────────────
 
-    def _is_jpeg(self, filename: str) -> bool:
-        return Path(filename).suffix.lower() in _JPEG_EXTS
+    def _is_jpeg(self, path: Path) -> bool:
+        return path.suffix.lower() in _JPEG_EXTS
 
-    def _sidecar_path(self, filename: str) -> Path:
-        return self._folder / (Path(filename).stem + ".xmp")
+    def _sidecar_path(self, path: Path) -> Path:
+        return path.parent / (path.stem + ".xmp")
 
-    def _update(self, filename: str, entry: dict):
-        self._cache[filename] = entry
-        self._write(filename, entry)
+    def _update(self, path: Path, entry: dict):
+        self._cache[str(path)] = entry
+        self._write(path, entry)
 
     # ── reading ───────────────────────────────────────────────────────────────
 
-    def _read(self, filename: str) -> dict:
-        if self._is_jpeg(filename):
+    def _read(self, path: Path) -> dict:
+        if self._is_jpeg(path):
             # Embedded XMP is canonical for JPEGs
-            img = self._folder / filename
-            if img.exists():
-                result = self._read_jpeg_xmp(img)
+            if path.exists():
+                result = self._read_jpeg_xmp(path)
                 if self._is_non_default(result):
                     return result
             # Fall back to sidecar (handles migration from old app version)
-            xmp = self._sidecar_path(filename)
+            xmp = self._sidecar_path(path)
             if xmp.exists():
                 try:
                     return self._parse_xmp(xmp.read_text(encoding="utf-8"))
                 except Exception:
                     pass
         else:
-            xmp = self._sidecar_path(filename)
+            xmp = self._sidecar_path(path)
             if xmp.exists():
                 try:
                     return self._parse_xmp(xmp.read_text(encoding="utf-8"))
@@ -193,29 +195,25 @@ class MetadataStore:
 
     # ── writing ───────────────────────────────────────────────────────────────
 
-    def _write(self, filename: str, entry: dict):
-        if not self._folder:
-            return
-
-        if self._is_jpeg(filename):
-            img = self._folder / filename
-            if not img.exists():
+    def _write(self, path: Path, entry: dict):
+        if self._is_jpeg(path):
+            if not path.exists():
                 return
             is_default = not self._is_non_default(entry)
             xmp_xml = None if is_default else self._build_xmp_xml(entry)
             try:
-                original = img.read_bytes()
+                original = path.read_bytes()
                 modified = self._embed_xmp_jpeg(original, xmp_xml)
                 if modified != original:
-                    self._atomic_write(img, modified)
+                    self._atomic_write(path, modified)
             except Exception:
                 # Fallback: write sidecar if JPEG embedding fails
-                self._write_sidecar(filename, entry)
+                self._write_sidecar(path, entry)
         else:
-            self._write_sidecar(filename, entry)
+            self._write_sidecar(path, entry)
 
-    def _write_sidecar(self, filename: str, entry: dict):
-        xmp_path = self._sidecar_path(filename)
+    def _write_sidecar(self, path: Path, entry: dict):
+        xmp_path = self._sidecar_path(path)
         if not self._is_non_default(entry):
             try:
                 if xmp_path.exists():
@@ -358,14 +356,14 @@ class MetadataStore:
 
         migrated = 0
         for filename, entry in data.items():
-            if self._is_jpeg(filename):
-                img = folder / filename
-                if img.exists() and not self._read_jpeg_xmp(img) != dict(_DEFAULT):
-                    self._write(filename, entry)
+            path = folder / filename
+            if self._is_jpeg(path):
+                if path.exists() and not self._is_non_default(self._read_jpeg_xmp(path)):
+                    self._write(path, entry)
                     migrated += 1
             else:
-                if not self._sidecar_path(filename).exists():
-                    self._write(filename, entry)
+                if not self._sidecar_path(path).exists():
+                    self._write(path, entry)
                     migrated += 1
 
         if migrated:

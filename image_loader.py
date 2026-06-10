@@ -44,10 +44,24 @@ def supported_extensions() -> set:
     return exts
 
 
-def scan_folder(folder: Path) -> list:
+def scan_folder(folder: Path, recursive: bool = False) -> list:
     exts = supported_extensions()
-    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts]
+    if recursive:
+        files = [f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in exts]
+    else:
+        files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts]
     return sorted(files, key=lambda p: p.name.lower())
+
+
+def has_image_subfolders(folder: Path) -> bool:
+    """Return True if folder has any subdirectory containing images."""
+    exts = supported_extensions()
+    for sub in folder.iterdir():
+        if sub.is_dir():
+            for f in sub.iterdir():
+                if f.is_file() and f.suffix.lower() in exts:
+                    return True
+    return False
 
 
 def _to_rgb(img: Image.Image) -> Image.Image:

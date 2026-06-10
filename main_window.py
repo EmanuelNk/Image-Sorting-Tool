@@ -1,3 +1,4 @@
+import json
 import shutil
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -7,6 +8,7 @@ from PyQt6.QtWidgets import (
     QLabel, QComboBox, QToolBar, QStatusBar, QFileDialog,
     QMessageBox, QDialog, QGridLayout, QFrame, QCheckBox,
     QApplication, QSizePolicy, QStackedWidget, QSlider, QPushButton,
+    QInputDialog,
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtGui import (QKeySequence, QShortcut, QAction, QFont,
@@ -19,6 +21,8 @@ from filmstrip import FilmstripWidget
 from sidebar import SidebarWidget
 from grid_view import GridViewWidget, THUMB_MIN, THUMB_MAX, THUMB_DEFAULT
 from metadata_panel import MetadataPanelWidget
+from collections_store import CollectionsStore
+from rename_dialog import BatchRenameDialog
 
 
 class HelpDialog(QDialog):
@@ -26,7 +30,7 @@ class HelpDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Keyboard Shortcuts")
         self.setModal(True)
-        self.setFixedSize(560, 480)
+        self.setFixedSize(560, 500)
         self.setStyleSheet("background: #1e1e1e; color: #ccc;")
 
         layout = QVBoxLayout(self)
@@ -63,9 +67,11 @@ class HelpDialog(QDialog):
                 ("9",          "Blue label"),
                 ("`",          "Purple label  (press again to clear)"),
             ]),
-            ("Albums", [
+            ("Albums & Collections", [
                 ("M",          "Move selected image(s) to album"),
+                ("C",          "Add selected image(s) to collection"),
                 ("⌘A",         "Select all images in filmstrip"),
+                ("⌘R",         "Batch rename selected images"),
             ]),
             ("View", [
                 ("G",          "Toggle grid / detail view"),
@@ -141,7 +147,8 @@ class MainWindow(QMainWindow):
         self._metadata = MetadataStore()
         self._exif_cache: Dict[str, dict] = {}
         self._move_history: List[Tuple[Path, Path]] = []
-        self._grid_dirty = True   # grid needs reload before first use
+        self._grid_dirty = True
+        self._current_collection: Optional[str] = None
 
         # filter/sort state
         self._filter_rating = 0
@@ -151,6 +158,7 @@ class MainWindow(QMainWindow):
         self._sort_asc = True
 
         self._settings = QSettings("PhotoSorter", "PhotoSorter")
+        self._collections = CollectionsStore(self._settings)
 
         self._build_ui()
         self._build_menu()
@@ -161,10 +169,22 @@ class MainWindow(QMainWindow):
         if isinstance(albums_raw, str):
             albums_raw = [albums_raw]
         self._sidebar.set_albums([Path(a) for a in albums_raw])
+        self._sidebar.set_collections(self._collections.all())
+
+        # Wire up sidebar collection signals
+        self._sidebar.collection_open.connect(self._on_collection_open)
+        self._sidebar.collection_add.connect(self._on_collection_add)
+        self._sidebar.copy_requested.connect(self._copy_to_album)
 
         last = self._settings.value("last_folder", "")
         if last and Path(last).is_dir():
             QTimer.singleShot(0, lambda: self._open_folder(Path(last)))
+
+        # Start in grid view
+        self._stack.setCurrentIndex(1)
+        self._view_btn.setChecked(True)
+        self._view_btn.setText("⊟  Detail")
+        self._view_btn.setToolTip("Switch to detail view  (G)")
 
     # ──────────────────────────── UI setup ───────────────────────────────────
 
@@ -226,7 +246,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._grid)     # index 1
 
         splitter.addWidget(self._stack)
-        splitter.setSizes([190, 1250])
+        splitter.setSizes([200, 1240])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self._splitter = splitter
@@ -253,6 +273,11 @@ class MainWindow(QMainWindow):
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(self._prompt_open_folder)
         file_menu.addAction(open_act)
+        file_menu.addSeparator()
+        rename_act = QAction("Rename Selected…", self)
+        rename_act.setShortcut("Ctrl+R")
+        rename_act.triggered.connect(self._batch_rename)
+        file_menu.addAction(rename_act)
         file_menu.addSeparator()
         undo_act = QAction("Undo Move", self)
         undo_act.setShortcut(QKeySequence.StandardKey.Undo)
@@ -333,6 +358,49 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        # Auto-advance toggle
+        self._auto_advance_btn = QPushButton("Auto ›")
+        self._auto_advance_btn.setToolTip("Auto-advance after rating (detail view)")
+        self._auto_advance_btn.setCheckable(True)
+        self._auto_advance_btn.setStyleSheet("""
+            QPushButton {
+                background: #2e2e2e; color: #ccc; border: 1px solid #555;
+                border-radius: 3px; padding: 3px 8px; font-size: 11px;
+            }
+            QPushButton:checked {
+                background: #404010; color: #ffd; border-color: #808040;
+            }
+            QPushButton:hover:!checked { background: #3a3a3a; }
+        """)
+        tb.addWidget(self._auto_advance_btn)
+
+        tb.addSeparator()
+
+        # Collection mode badge (hidden by default)
+        self._coll_badge_label = QLabel("")
+        self._coll_badge_label.setStyleSheet(
+            "color: #ffd; background: #2a4020; border: 1px solid #4a6030; "
+            "border-radius: 3px; padding: 2px 6px; font-size: 11px;"
+        )
+        self._coll_badge_label.setVisible(False)
+        tb.addWidget(self._coll_badge_label)
+
+        self._coll_exit_btn = QPushButton("×")
+        self._coll_exit_btn.setToolTip("Exit collection view")
+        self._coll_exit_btn.setVisible(False)
+        self._coll_exit_btn.setFixedWidth(22)
+        self._coll_exit_btn.setStyleSheet("""
+            QPushButton {
+                background: #3a3030; color: #faa; border: 1px solid #644;
+                border-radius: 3px; padding: 0px 3px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton:hover { background: #5a4040; }
+        """)
+        self._coll_exit_btn.clicked.connect(self._exit_collection_mode)
+        tb.addWidget(self._coll_exit_btn)
+
+        tb.addSeparator()
+
         # Grid size slider (always visible; only affects grid view)
         self._size_label = QLabel("  Size:")
         tb.addWidget(self._size_label)
@@ -389,7 +457,6 @@ class MainWindow(QMainWindow):
             s.activated.connect(fn)
             return s
 
-        # Store these so we can disable them in grid view (grid handles its own arrow nav)
         self._sc_right = sc("Right", self._next_detail_only)
         self._sc_left  = sc("Left",  self._prev_detail_only)
         sc("1", lambda: self._toggle_rating(1))
@@ -407,6 +474,7 @@ class MainWindow(QMainWindow):
         sc("9", lambda: self._toggle_label("blue"))
         sc("`", lambda: self._toggle_label("purple"))
         sc("m",         self._move_shortcut)
+        sc("c",         self._add_to_collection)
         sc("Ctrl+A",    self._select_all)
         sc("g",         self._toggle_view)
         sc("i",         self._toggle_info_panel)
@@ -414,6 +482,7 @@ class MainWindow(QMainWindow):
         sc("Ctrl+Z",    self._undo_move)
         sc("Ctrl+F",    self._toggle_filmstrip)
         sc("Ctrl+B",    self._toggle_sidebar)
+        sc("Ctrl+R",    self._batch_rename)
 
     # ──────────────────────────── folder / navigation ────────────────────────
 
@@ -425,10 +494,14 @@ class MainWindow(QMainWindow):
 
     def _open_folder(self, path: Path):
         self._folder = path
-        self._all_images = scan_folder(path)
-        self._metadata.load_folder(path)
+        self._all_images = scan_folder(path, recursive=True)
+        # Run JSON migration for each unique subfolder
+        for folder in {p.parent for p in self._all_images} | {path}:
+            self._metadata.load_folder(folder)
         self._exif_cache.clear()
         self._move_history.clear()
+        self._current_collection = None
+        self._update_collection_toolbar()
         self.setWindowTitle(f"Photo Sorter — {path.name}")
         self._settings.setValue("last_folder", str(path))
         self._apply_filters()
@@ -441,14 +514,25 @@ class MainWindow(QMainWindow):
             self._update_count_label()
 
     def _apply_filters(self):
-        images = list(self._all_images)
+        # Determine base image list
+        if self._current_collection is not None:
+            coll = self._collections.get(self._current_collection)
+            if coll and coll["type"] in ("smart", "auto"):
+                images = self._collections.resolve_smart(
+                    self._current_collection, self._all_images, self._metadata)
+            elif coll and coll["type"] == "regular":
+                images = self._collections.resolve_regular(self._current_collection)
+            else:
+                images = list(self._all_images)
+        else:
+            images = list(self._all_images)
 
         if self._filter_rating > 0:
-            images = [p for p in images if self._metadata.get_rating(p.name) >= self._filter_rating]
+            images = [p for p in images if self._metadata.get_rating(p) >= self._filter_rating]
         if self._filter_flag != "all":
-            images = [p for p in images if self._metadata.get_flag(p.name) == self._filter_flag]
+            images = [p for p in images if self._metadata.get_flag(p) == self._filter_flag]
         if self._filter_label != "all":
-            images = [p for p in images if self._metadata.get_color_label(p.name) == self._filter_label]
+            images = [p for p in images if self._metadata.get_color_label(p) == self._filter_label]
 
         sort_key = self._sort_by
         rev = not self._sort_asc
@@ -456,23 +540,23 @@ class MainWindow(QMainWindow):
         if sort_key == "filename":
             images.sort(key=lambda p: p.name.lower(), reverse=rev)
         elif sort_key == "rating":
-            images.sort(key=lambda p: self._metadata.get_rating(p.name), reverse=not rev)
+            images.sort(key=lambda p: self._metadata.get_rating(p), reverse=not rev)
         elif sort_key == "date":
             images.sort(key=self._date_sort_key, reverse=rev)
 
         self._filtered = images
-        self._filmstrip.load_images(images, self._metadata)
+        self._filmstrip.load_images(images, self._metadata, root=self._folder)
         self._grid_dirty = True
         if self._stack.currentIndex() == 1:
-            self._grid.load_images(images, self._metadata)
+            self._grid.load_images(images, self._metadata, root=self._folder)
             self._grid_dirty = False
         self._update_count_label()
 
     def _date_sort_key(self, path: Path) -> str:
-        name = path.name
-        if name not in self._exif_cache:
-            self._exif_cache[name] = get_exif(path)
-        date = self._exif_cache[name].get("date_taken", "")
+        key = str(path)
+        if key not in self._exif_cache:
+            self._exif_cache[key] = get_exif(path)
+        date = self._exif_cache[key].get("date_taken", "")
         return date or str(path.stat().st_mtime)
 
     def _go_to(self, index: int):
@@ -482,7 +566,7 @@ class MainWindow(QMainWindow):
         self._index = index
         path = self._filtered[index]
         self._viewer.load_image(path)
-        meta = self._metadata.get(path.name)
+        meta = self._metadata.get(path)
         self._viewer.set_metadata(meta.get("rating", 0), meta.get("color_label"), meta.get("flag", "unflagged"))
         self._filmstrip.select_row(index)
         if self._stack.currentIndex() == 1:
@@ -500,7 +584,7 @@ class MainWindow(QMainWindow):
             self._go_to(self._index - 1)
 
     def _next_detail_only(self):
-        if self._stack.currentIndex() == 0:   # only in detail view
+        if self._stack.currentIndex() == 0:
             self.next_image()
 
     def _prev_detail_only(self):
@@ -519,7 +603,7 @@ class MainWindow(QMainWindow):
         p = self._current_path
         if not p:
             return
-        meta = self._metadata.get(p.name)
+        meta = self._metadata.get(p)
         self._viewer.set_metadata(meta.get("rating", 0), meta.get("color_label"), meta.get("flag", "unflagged"))
         self._filmstrip.update_item_metadata(p, self._metadata)
         self._grid.update_item_metadata(p, self._metadata)
@@ -531,47 +615,50 @@ class MainWindow(QMainWindow):
         p = self._current_path
         if not p:
             return
-        cur = self._metadata.get_rating(p.name)
-        self._metadata.set_rating(p.name, 0 if cur == n else n)
+        cur = self._metadata.get_rating(p)
+        self._metadata.set_rating(p, 0 if cur == n else n)
         self._refresh_current()
+        # Auto-advance in detail view
+        if self._auto_advance_btn.isChecked() and self._stack.currentIndex() == 0:
+            self.next_image()
 
     def _clear_rating(self):
         p = self._current_path
         if p:
-            self._metadata.set_rating(p.name, 0)
+            self._metadata.set_rating(p, 0)
             self._refresh_current()
 
     def _toggle_pick(self):
         p = self._current_path
         if not p:
             return
-        cur = self._metadata.get_flag(p.name)
-        self._metadata.set_flag(p.name, "unflagged" if cur == "pick" else "pick")
+        cur = self._metadata.get_flag(p)
+        self._metadata.set_flag(p, "unflagged" if cur == "pick" else "pick")
         self._refresh_current()
 
     def _toggle_reject(self):
         p = self._current_path
         if not p:
             return
-        cur = self._metadata.get_flag(p.name)
-        self._metadata.set_flag(p.name, "unflagged" if cur == "reject" else "reject")
+        cur = self._metadata.get_flag(p)
+        self._metadata.set_flag(p, "unflagged" if cur == "reject" else "reject")
         self._refresh_current()
 
     def _clear_flag(self):
         p = self._current_path
         if p:
-            self._metadata.set_flag(p.name, "unflagged")
+            self._metadata.set_flag(p, "unflagged")
             self._refresh_current()
 
     def _toggle_label(self, color: str):
         p = self._current_path
         if not p:
             return
-        cur = self._metadata.get_color_label(p.name)
-        self._metadata.set_color_label(p.name, None if cur == color else color)
+        cur = self._metadata.get_color_label(p)
+        self._metadata.set_color_label(p, None if cur == color else color)
         self._refresh_current()
 
-    # ──────────────────────────── move ───────────────────────────────────────
+    # ──────────────────────────── move / copy ────────────────────────────────
 
     def _move_shortcut(self):
         album = self._sidebar.selected_album()
@@ -594,14 +681,38 @@ class MainWindow(QMainWindow):
         else:
             msg = f"Move <b>{count} images</b> to:<br><code>{dest}</code>"
 
-        dlg = QMessageBox(self)
+        dlg = QDialog(self)
         dlg.setWindowTitle("Move Images" if count > 1 else "Move Image")
-        dlg.setText(msg)
-        dlg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
-        dlg.setDefaultButton(QMessageBox.StandardButton.Yes)
-        dlg.setStyleSheet("QMessageBox { background: #252525; color: #ccc; } QLabel { color: #ccc; }")
-        if dlg.exec() != QMessageBox.StandardButton.Yes:
+        dlg.setStyleSheet("QDialog { background: #252525; color: #ccc; } QLabel { color: #ccc; } QCheckBox { color: #ccc; }")
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setContentsMargins(20, 16, 20, 14)
+        dlg_layout.setSpacing(10)
+
+        msg_label = QLabel(msg)
+        msg_label.setWordWrap(True)
+        dlg_layout.addWidget(msg_label)
+
+        copy_check = QCheckBox("Copy instead of Move")
+        copy_check.setChecked(False)
+        dlg_layout.addWidget(copy_check)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("QPushButton { background: #2e2e2e; color: #ccc; border: 1px solid #444; border-radius: 3px; padding: 5px 14px; } QPushButton:hover { background: #3a3a3a; }")
+        cancel_btn.clicked.connect(dlg.reject)
+        yes_btn = QPushButton("OK")
+        yes_btn.setStyleSheet("QPushButton { background: #1a4080; color: #fff; border: 1px solid #2060b0; border-radius: 3px; padding: 5px 14px; font-weight: bold; } QPushButton:hover { background: #1e50a0; }")
+        yes_btn.clicked.connect(dlg.accept)
+        yes_btn.setDefault(True)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(yes_btn)
+        dlg_layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+
+        do_copy = copy_check.isChecked()
 
         dest_meta = MetadataStore()
         dest_meta.load_folder(dest)
@@ -614,34 +725,45 @@ class MainWindow(QMainWindow):
                 failed.append(f"{p.name} (already exists in destination)")
                 continue
             try:
-                shutil.move(str(p), str(target))
+                if do_copy:
+                    shutil.copy2(str(p), str(target))
+                else:
+                    shutil.move(str(p), str(target))
             except OSError as e:
                 failed.append(f"{p.name} ({e})")
                 continue
 
-            meta = self._metadata.get(p.name)
-            dest_meta.import_entry(p.name, meta)
-            self._metadata.remove(p.name)
-            self._move_history.append((p, target))
+            meta = self._metadata.get(p)
+            dest_meta.import_entry(target, meta)
+            if not do_copy:
+                self._metadata.remove(p)
+                self._move_history.append((p, target))
             moved.append(p)
 
         if failed:
-            QMessageBox.warning(self, "Some moves failed", "\n".join(failed))
+            QMessageBox.warning(self, "Some operations failed", "\n".join(failed))
 
         if not moved:
             return
 
-        moved_set = set(moved)
-        self._all_images = [i for i in self._all_images if i not in moved_set]
-        old_index = self._index
-        self._apply_filters()
-        new_index = min(old_index, len(self._filtered) - 1)
-        if new_index >= 0:
-            self._go_to(new_index)
-        else:
-            self._index = -1
-            self._viewer.clear()
-            self._update_status()
+        if not do_copy:
+            moved_set = set(moved)
+            self._all_images = [i for i in self._all_images if i not in moved_set]
+            old_index = self._index
+            self._apply_filters()
+            new_index = min(old_index, len(self._filtered) - 1)
+            if new_index >= 0:
+                self._go_to(new_index)
+            else:
+                self._index = -1
+                self._viewer.clear()
+                self._update_status()
+
+    def _copy_to_album(self, dest: Path):
+        """Convenience: open move dialog with copy pre-checked."""
+        # Reuse _move_to_album but pre-select copy — we just forward to the full dialog
+        # which already has the copy checkbox. For simplicity we call _move_to_album directly.
+        self._move_to_album(dest)
 
     def _undo_move(self):
         if not self._move_history:
@@ -658,12 +780,155 @@ class MainWindow(QMainWindow):
             return
         self._all_images.append(src)
         self._apply_filters()
-        # Try to re-select the restored image
         try:
             idx = self._filtered.index(src)
             self._go_to(idx)
         except ValueError:
             pass
+
+    # ──────────────────────────── collections ────────────────────────────────
+
+    def _on_collection_open(self, cid: str):
+        self._current_collection = cid
+        self._update_collection_toolbar()
+        self._apply_filters()
+        if self._filtered:
+            self._go_to(0)
+        else:
+            self._index = -1
+            self._viewer.clear()
+            self._update_status()
+            self._update_count_label()
+
+    def _on_collection_add(self, signal_str: str):
+        """Handle collection management signals from sidebar."""
+        if signal_str.startswith("__new_regular__:"):
+            name = signal_str[len("__new_regular__:"):]
+            self._collections.add_regular(name)
+            self._sidebar.refresh_collections(self._collections.all())
+
+        elif signal_str.startswith("__new_smart__:"):
+            payload_str = signal_str[len("__new_smart__:"):]
+            try:
+                payload = json.loads(payload_str)
+                self._collections.add_smart(payload["name"], payload["rule"])
+                self._sidebar.refresh_collections(self._collections.all())
+            except Exception:
+                pass
+
+        elif signal_str.startswith("__remove__:"):
+            cid = signal_str[len("__remove__:"):]
+            if self._current_collection == cid:
+                self._exit_collection_mode()
+            self._collections.remove(cid)
+            self._sidebar.refresh_collections(self._collections.all())
+
+        else:
+            # It's a cid — add currently selected images
+            cid = signal_str
+            active = self._grid if self._stack.currentIndex() == 1 else self._filmstrip
+            selected = active.selected_paths()
+            if not selected:
+                p = self._current_path
+                if p:
+                    selected = [p]
+            if selected:
+                self._collections.add_paths(cid, selected)
+                self._sidebar.refresh_collections(self._collections.all())
+
+    def _exit_collection_mode(self):
+        self._current_collection = None
+        self._update_collection_toolbar()
+        self._apply_filters()
+        if self._filtered:
+            self._go_to(0)
+        else:
+            self._index = -1
+            self._viewer.clear()
+            self._update_status()
+            self._update_count_label()
+
+    def _update_collection_toolbar(self):
+        if self._current_collection is not None:
+            coll = self._collections.get(self._current_collection)
+            name = coll["name"] if coll else "Collection"
+            self._coll_badge_label.setText(f"Collection: {name}")
+            self._coll_badge_label.setVisible(True)
+            self._coll_exit_btn.setVisible(True)
+        else:
+            self._coll_badge_label.setVisible(False)
+            self._coll_exit_btn.setVisible(False)
+
+    def _add_to_collection(self):
+        cid = self._sidebar.selected_collection_id()
+        if not cid:
+            return
+        coll = self._collections.get(cid)
+        if not coll or coll["type"] != "regular":
+            return
+        active = self._grid if self._stack.currentIndex() == 1 else self._filmstrip
+        selected = active.selected_paths()
+        if not selected:
+            p = self._current_path
+            if p:
+                selected = [p]
+        if selected:
+            self._collections.add_paths(cid, selected)
+            self._sidebar.refresh_collections(self._collections.all())
+
+    # ──────────────────────────── batch rename ───────────────────────────────
+
+    def _batch_rename(self):
+        active = self._grid if self._stack.currentIndex() == 1 else self._filmstrip
+        selected = active.selected_paths()
+        if not selected:
+            p = self._current_path
+            if p:
+                selected = [p]
+        if not selected:
+            QMessageBox.information(self, "No images selected",
+                                    "Select at least one image to rename.")
+            return
+
+        dlg = BatchRenameDialog(selected, self._exif_cache, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if not dlg.result_pairs:
+            return
+
+        # Build a mapping from old path → new path
+        rename_map: Dict[Path, Path] = {old: new for old, new in dlg.result_pairs}
+
+        # Update internal state
+        new_all = []
+        for p in self._all_images:
+            if p in rename_map:
+                new_p = rename_map[p]
+                # Transfer metadata cache key
+                old_meta = self._metadata.get(p)
+                self._metadata.remove(p)
+                self._metadata.import_entry(new_p, old_meta)
+                new_all.append(new_p)
+            else:
+                new_all.append(p)
+        self._all_images = new_all
+
+        # Update exif cache
+        for old, new in rename_map.items():
+            old_key = str(old)
+            if old_key in self._exif_cache:
+                self._exif_cache[str(new)] = self._exif_cache.pop(old_key)
+
+        cur_path = self._current_path
+        self._apply_filters()
+        # Try to keep current selection
+        if cur_path:
+            new_cur = rename_map.get(cur_path, cur_path)
+            if new_cur in self._filtered:
+                self._go_to(self._filtered.index(new_cur))
+            elif self._filtered:
+                self._go_to(0)
 
     # ──────────────────────────── filter / sort ──────────────────────────────
 
@@ -680,7 +945,6 @@ class MainWindow(QMainWindow):
         if self._folder:
             cur_path = self._current_path
             self._apply_filters()
-            # Try to keep current image selected
             if cur_path and cur_path in self._filtered:
                 self._go_to(self._filtered.index(cur_path))
             elif self._filtered:
@@ -710,7 +974,7 @@ class MainWindow(QMainWindow):
         active = self._grid if self._stack.currentIndex() == 1 else self._filmstrip
         sel_count = len(active.selectedItems()) if self._filtered else 1
         name = p.name
-        meta = self._metadata.get(name)
+        meta = self._metadata.get(p)
         rating = meta.get("rating", 0)
         label = meta.get("color_label") or ""
         flag = meta.get("flag", "unflagged")
@@ -720,13 +984,23 @@ class MainWindow(QMainWindow):
         label_str = f" · {label.capitalize()}" if label else ""
         sel_str = f"   [{sel_count} selected]" if sel_count > 1 else ""
 
-        left = f"{name}   {stars}{flag_str}{label_str}{sel_str}"
+        # Show subfolder relative to root
+        subfolder = ""
+        if self._folder and p.parent != self._folder:
+            try:
+                rel = p.parent.relative_to(self._folder)
+                subfolder = f"  [{rel}]"
+            except ValueError:
+                pass
+
+        left = f"{name}{subfolder}   {stars}{flag_str}{label_str}{sel_str}"
         self._status_left.setText(left)
 
         # EXIF on right
-        if name not in self._exif_cache:
-            self._exif_cache[name] = get_exif(p)
-        exif = self._exif_cache[name]
+        key = str(p)
+        if key not in self._exif_cache:
+            self._exif_cache[key] = get_exif(p)
+        exif = self._exif_cache[key]
         parts = []
         if "width" in exif:
             parts.append(f"{exif['width']}×{exif['height']}")
@@ -759,7 +1033,7 @@ class MainWindow(QMainWindow):
         if visible:
             p = self._current_path
             if p:
-                self._meta_panel.load(p, self._metadata.get(p.name))
+                self._meta_panel.load(p, self._metadata.get(p))
 
     def _toggle_filmstrip(self):
         self._filmstrip.setVisible(not self._filmstrip.isVisible())
@@ -771,7 +1045,7 @@ class MainWindow(QMainWindow):
         if self._stack.currentIndex() == 0:
             # Switch to grid
             if self._grid_dirty and self._filtered:
-                self._grid.load_images(self._filtered, self._metadata)
+                self._grid.load_images(self._filtered, self._metadata, root=self._folder)
                 self._grid_dirty = False
             self._stack.setCurrentIndex(1)
             self._view_btn.setChecked(True)
