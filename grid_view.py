@@ -17,7 +17,29 @@ _LABEL_H = 26
 _PATH_ROLE = Qt.ItemDataRole.UserRole
 _META_ROLE = Qt.ItemDataRole.UserRole + 1
 _PIXMAP_ROLE = Qt.ItemDataRole.UserRole + 2
-_SUBFOLDER_ROLE = Qt.ItemDataRole.UserRole + 3
+_SUBFOLDER_ROLE  = Qt.ItemDataRole.UserRole + 3
+_FILETYPE_ROLE   = Qt.ItemDataRole.UserRole + 4
+
+_RAW_EXTS = {".raf", ".nef", ".cr2", ".cr3", ".arw", ".dng", ".orf", ".rw2", ".raw", ".pef"}
+_HEIF_EXTS = {".hif", ".heic", ".heif"}
+
+def _filetype_label(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        return "JPG"
+    if ext in (".tiff", ".tif"):
+        return "TIF"
+    return ext.lstrip(".").upper()
+
+def _filetype_color(label: str) -> QColor:
+    if label == "JPG":
+        return QColor(50, 50, 50, 210)
+    if label in ("HIF", "HEIC", "HEIF"):
+        return QColor(20, 60, 100, 210)
+    # RAW formats
+    if label in ("RAF", "NEF", "CR2", "CR3", "ARW", "DNG", "ORF", "RW2", "PEF", "RAW"):
+        return QColor(90, 55, 10, 220)
+    return QColor(40, 40, 40, 200)
 
 _COLOR_MAP = {
     "red":    QColor(192, 57, 43),
@@ -88,6 +110,21 @@ class _GridDelegate(QStyledItemDelegate):
         else:
             painter.setPen(QColor(60, 60, 60))
             painter.drawText(thumb_r, Qt.AlignmentFlag.AlignCenter, "…")
+
+        # File type badge — top-left corner
+        ft_label = index.data(_FILETYPE_ROLE) or ""
+        if ft_label:
+            ft_font = QFont()
+            ft_font.setPointSize(max(6, min(9, self.thumb_size // 22)))
+            ft_font.setBold(True)
+            painter.setFont(ft_font)
+            fm = painter.fontMetrics()
+            badge_w = fm.horizontalAdvance(ft_label) + 6
+            badge_h = fm.height() + 2
+            badge_r = QRect(thumb_r.x() + 4, thumb_r.y() + 4, badge_w, badge_h)
+            painter.fillRect(badge_r, _filetype_color(ft_label))
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(badge_r, Qt.AlignmentFlag.AlignCenter, ft_label)
 
         meta: dict = index.data(_META_ROLE) or {}
         rating = meta.get("rating", 0)
@@ -228,6 +265,7 @@ class GridViewWidget(QListWidget):
             item.setData(_META_ROLE, metadata.get(path))
             item.setData(_PIXMAP_ROLE, None)
             item.setData(_SUBFOLDER_ROLE, subfolder)
+            item.setData(_FILETYPE_ROLE, _filetype_label(path))
             self.addItem(item)
             self._path_to_row[str(path)] = i
 
