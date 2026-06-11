@@ -3,10 +3,10 @@ from typing import Optional, List
 
 from PyQt6.QtWidgets import (QListWidget, QListWidgetItem, QStyledItemDelegate,
                               QStyle, QAbstractItemView)
-from PyQt6.QtCore import Qt, pyqtSignal, QRunnable, QThreadPool, QObject, QSize, QRect
-from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPen
+from PyQt6.QtCore import Qt, pyqtSignal, QRunnable, QThreadPool, QObject, QSize, QRect, QRectF, QPoint, QTimer
+from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPen, QPainterPath, QTransform
 
-from image_loader import load_thumbnail
+from image_loader import load_thumbnail_cached
 from metadata import MetadataStore
 
 THUMB_MIN = 80
@@ -17,6 +17,29 @@ _LABEL_H = 26
 _PATH_ROLE = Qt.ItemDataRole.UserRole
 _META_ROLE = Qt.ItemDataRole.UserRole + 1
 _PIXMAP_ROLE = Qt.ItemDataRole.UserRole + 2
+_SUBFOLDER_ROLE  = Qt.ItemDataRole.UserRole + 3
+_FILETYPE_ROLE   = Qt.ItemDataRole.UserRole + 4
+
+_RAW_EXTS = {".raf", ".nef", ".cr2", ".cr3", ".arw", ".dng", ".orf", ".rw2", ".raw", ".pef"}
+_HEIF_EXTS = {".hif", ".heic", ".heif"}
+
+def _filetype_label(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        return "JPG"
+    if ext in (".tiff", ".tif"):
+        return "TIF"
+    return ext.lstrip(".").upper()
+
+def _filetype_color(label: str) -> QColor:
+    if label == "JPG":
+        return QColor(58, 58, 60, 230)
+    if label in ("HIF", "HEIC", "HEIF"):
+        return QColor(0, 70, 140, 230)
+    # RAW formats
+    if label in ("RAF", "NEF", "CR2", "CR3", "ARW", "DNG", "ORF", "RW2", "PEF", "RAW"):
+        return QColor(110, 65, 0, 230)
+    return QColor(44, 44, 46, 230)
 
 _COLOR_MAP = {
     "red":    QColor(192, 57, 43),
@@ -32,7 +55,7 @@ class _ThumbSignals(QObject):
 
 
 class _ThumbLoader(QRunnable):
-    LOAD_SIZE = 600  # load at fixed high-res; delegate scales down
+    LOAD_SIZE = 400  # cached thumbnails; sharp at THUMB_MAX (360px)
 
     def __init__(self, path: Path):
         super().__init__()
@@ -41,7 +64,7 @@ class _ThumbLoader(QRunnable):
         self.setAutoDelete(True)
 
     def run(self):
-        img = load_thumbnail(self.path, (self.LOAD_SIZE, self.LOAD_SIZE))
+        img = load_thumbnail_cached(self.path, (self.LOAD_SIZE, self.LOAD_SIZE))
         if img is None:
             return
         img = img.convert("RGB")
@@ -67,15 +90,26 @@ class _GridDelegate(QStyledItemDelegate):
         return QSize(s + 6, s + _LABEL_H + 6)
 
     def paint(self, painter, option, index):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.save()
         thumb_r, bottom_r = self._rects(option.rect)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
 
-        painter.fillRect(option.rect, QColor(22, 22, 22))
-        painter.fillRect(thumb_r, QColor(40, 40, 40))
+        corner_r = max(4, self.thumb_size // 30)
+
+        painter.fillRect(option.rect, QColor(28, 28, 30))
+
+        # Rounded thumbnail background
+        thumb_path = QPainterPath()
+        thumb_path.addRoundedRect(QRectF(thumb_r), corner_r, corner_r)
+        painter.fillPath(thumb_path, QColor(44, 44, 46))
 
         pixmap: Optional[QPixmap] = index.data(_PIXMAP_ROLE)
         if pixmap:
+            rotation = (index.data(_META_ROLE) or {}).get("rotation", 0)
+            if rotation:
+                pixmap = pixmap.transformed(QTransform().rotate(rotation),
+                                            Qt.TransformationMode.SmoothTransformation)
             scaled = pixmap.scaled(
                 thumb_r.width(), thumb_r.height(),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -83,10 +117,30 @@ class _GridDelegate(QStyledItemDelegate):
             )
             px = thumb_r.x() + (thumb_r.width() - scaled.width()) // 2
             py = thumb_r.y() + (thumb_r.height() - scaled.height()) // 2
+            painter.save()
+            painter.setClipPath(thumb_path)
             painter.drawPixmap(px, py, scaled)
+            painter.restore()
         else:
-            painter.setPen(QColor(60, 60, 60))
+            painter.setPen(QColor(72, 72, 74))
             painter.drawText(thumb_r, Qt.AlignmentFlag.AlignCenter, "…")
+
+        # File type badge — top-left corner, pill-shaped
+        ft_label = index.data(_FILETYPE_ROLE) or ""
+        if ft_label:
+            ft_font = QFont()
+            ft_font.setPointSize(max(6, min(9, self.thumb_size // 22)))
+            ft_font.setBold(True)
+            painter.setFont(ft_font)
+            fm = painter.fontMetrics()
+            badge_w = fm.horizontalAdvance(ft_label) + 8
+            badge_h = fm.height() + 4
+            badge_r = QRect(thumb_r.x() + 5, thumb_r.y() + 5, badge_w, badge_h)
+            badge_path = QPainterPath()
+            badge_path.addRoundedRect(QRectF(badge_r), 4, 4)
+            painter.fillPath(badge_path, _filetype_color(ft_label))
+            painter.setPen(QColor(235, 235, 245))
+            painter.drawText(badge_r, Qt.AlignmentFlag.AlignCenter, ft_label)
 
         meta: dict = index.data(_META_ROLE) or {}
         rating = meta.get("rating", 0)
@@ -94,18 +148,31 @@ class _GridDelegate(QStyledItemDelegate):
         flag = meta.get("flag", "unflagged")
 
         if flag == "reject":
-            painter.fillRect(thumb_r, QColor(180, 0, 0, 70))
+            painter.save()
+            painter.setClipPath(thumb_path)
+            painter.fillRect(thumb_r, QColor(255, 69, 58, 60))
+            painter.restore()
 
         if color_label and color_label in _COLOR_MAP:
             strip = QRect(thumb_r.x(), thumb_r.bottom() - 3, thumb_r.width(), 4)
+            painter.save()
+            painter.setClipPath(thumb_path)
             painter.fillRect(strip, _COLOR_MAP[color_label])
+            painter.restore()
 
-        pen = QPen(QColor(255, 195, 30) if selected else QColor(50, 50, 50),
+        # Rounded selection border
+        pen = QPen(QColor(10, 132, 255) if selected else QColor(58, 58, 60, 160),
                    2 if selected else 1)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
-        painter.drawRect(thumb_r.adjusted(1, 1, -1, -1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        border_path = QPainterPath()
+        border_path.addRoundedRect(
+            QRectF(thumb_r).adjusted(1, 1, -1, -1), corner_r, corner_r
+        )
+        painter.drawPath(border_path)
 
-        painter.fillRect(bottom_r, QColor(18, 18, 18))
+        painter.fillRect(bottom_r, QColor(22, 22, 24))
 
         # Scale star font with thumb size
         star_pt = max(6, min(11, self.thumb_size // 18))
@@ -114,7 +181,7 @@ class _GridDelegate(QStyledItemDelegate):
         font.setPointSize(star_pt)
         painter.setFont(font)
         for i in range(5):
-            painter.setPen(QColor(255, 195, 0) if i < rating else QColor(55, 55, 55))
+            painter.setPen(QColor(255, 214, 10) if i < rating else QColor(72, 72, 74))
             painter.drawText(bottom_r.x() + 2 + i * star_w,
                              bottom_r.bottom() - 4,
                              "★" if i < rating else "☆")
@@ -124,10 +191,28 @@ class _GridDelegate(QStyledItemDelegate):
             ff.setPointSize(star_pt)
             ff.setBold(True)
             painter.setFont(ff)
-            painter.setPen(QColor(52, 152, 219) if flag == "pick" else QColor(231, 76, 60))
+            painter.setPen(QColor(48, 209, 88) if flag == "pick" else QColor(255, 69, 58))
             painter.drawText(bottom_r.right() - star_w - 2,
                              bottom_r.bottom() - 4,
                              "P" if flag == "pick" else "✕")
+
+        # Subfolder banner
+        subfolder = index.data(_SUBFOLDER_ROLE) or ""
+        if subfolder:
+            banner_h = max(14, star_pt + 6)
+            banner_r = QRect(thumb_r.x(), thumb_r.bottom() - banner_h - 4,
+                             thumb_r.width(), banner_h)
+            painter.save()
+            painter.setClipPath(thumb_path)
+            painter.fillRect(banner_r, QColor(0, 0, 0, 170))
+            painter.restore()
+            sf_font = QFont()
+            sf_font.setPointSize(max(6, star_pt - 1))
+            painter.setFont(sf_font)
+            painter.setPen(QColor(235, 235, 245, 200))
+            painter.drawText(banner_r.adjusted(3, 0, -2, 0),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             subfolder)
 
         painter.restore()
 
@@ -136,6 +221,7 @@ class GridViewWidget(QListWidget):
     image_selected = pyqtSignal(int)
     selection_changed = pyqtSignal(int)
     open_detail = pyqtSignal(int)   # double-click → switch to detail view
+    load_progress = pyqtSignal(int, int)  # (loaded, total) for the queued batch
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -154,25 +240,29 @@ class GridViewWidget(QListWidget):
         self._thumb_size = THUMB_DEFAULT
 
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(6)
+        self._pool.setMaxThreadCount(2)
         self._path_to_row: dict = {}
+        self._queued: set = set()
+        self._loaded_count = 0
         self._programmatic = False
 
         self.setStyleSheet("""
             QListWidget {
-                background: #161616;
+                background: #1C1C1E;
                 border: none;
                 outline: none;
             }
-            QListWidget::item { background: #161616; border: none; }
+            QListWidget::item { background: #1C1C1E; border: none; }
             QScrollBar:vertical {
-                background: #1e1e1e; width: 8px; margin: 0;
+                background: #2C2C2E; width: 8px; margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: #484848; border-radius: 4px; min-height: 30px;
+                background: #48484A; border-radius: 4px; min-height: 30px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
+
+        self.verticalScrollBar().valueChanged.connect(self._queue_visible_thumbs)
 
         self.currentRowChanged.connect(self._on_row_changed)
         self.itemSelectionChanged.connect(self._on_selection_changed)
@@ -194,29 +284,37 @@ class GridViewWidget(QListWidget):
             if item:
                 item.setSizeHint(hint)
         self.scheduleDelayedItemsLayout()
+        QTimer.singleShot(50, self._queue_visible_thumbs)
 
     # ── population ────────────────────────────────────────────────────────────
 
-    def load_images(self, paths: List[Path], metadata: MetadataStore):
+    def load_images(self, paths: List[Path], metadata: MetadataStore,
+                    root: Optional[Path] = None):
+        # Cancel pending (not-yet-started) loads from any previous folder
+        self._pool.clear()
+        self._queued.clear()
+        self._loaded_count = 0
+
         self.blockSignals(True)
         self.clear()
         self._path_to_row.clear()
 
         hint = QSize(self._thumb_size + 6, self._thumb_size + _LABEL_H + 6)
         for i, path in enumerate(paths):
+            subfolder = path.parent.name if (root and path.parent != root) else ""
             item = QListWidgetItem()
             item.setSizeHint(hint)
             item.setData(_PATH_ROLE, str(path))
-            item.setData(_META_ROLE, metadata.get(path.name))
+            item.setData(_META_ROLE, metadata.get(path))
             item.setData(_PIXMAP_ROLE, None)
+            item.setData(_SUBFOLDER_ROLE, subfolder)
+            item.setData(_FILETYPE_ROLE, _filetype_label(path))
             self.addItem(item)
             self._path_to_row[str(path)] = i
 
-            loader = _ThumbLoader(path)
-            loader.signals.loaded.connect(self._on_thumb_loaded)
-            self._pool.start(loader)
-
         self.blockSignals(False)
+        # Defer so the widget finishes layout before we hit-test for visible rows
+        QTimer.singleShot(50, self._queue_visible_thumbs)
 
     def update_item_metadata(self, path: Path, metadata: MetadataStore):
         key = str(path)
@@ -224,8 +322,47 @@ class GridViewWidget(QListWidget):
         if row is not None:
             item = self.item(row)
             if item:
-                item.setData(_META_ROLE, metadata.get(path.name))
+                item.setData(_META_ROLE, metadata.get(path))
                 self.update(self.indexFromItem(item))
+
+    # ── lazy thumbnail loading ────────────────────────────────────────────────
+
+    _LOAD_BUFFER = 30  # rows above/below the visible area to pre-load
+
+    def _queue_visible_thumbs(self):
+        """Queue thumbnail loads only for visible items plus a scroll buffer."""
+        count = self.count()
+        if count == 0:
+            return
+        vr = self.viewport().rect()
+
+        top_idx = self.indexAt(vr.topLeft())
+        bot_idx = self.indexAt(QPoint(vr.center().x(), vr.bottom() - 1))
+
+        top_row = top_idx.row() if top_idx.isValid() else 0
+        bot_row = bot_idx.row() if bot_idx.isValid() else count - 1
+        if bot_row < top_row:
+            bot_row = count - 1
+
+        start = max(0, top_row - self._LOAD_BUFFER)
+        end = min(count - 1, bot_row + self._LOAD_BUFFER)
+
+        for row in range(start, end + 1):
+            item = self.item(row)
+            if item is None:
+                continue
+            path_str = item.data(_PATH_ROLE)
+            if not path_str or path_str in self._queued:
+                continue
+            self._queued.add(path_str)
+            loader = _ThumbLoader(Path(path_str))
+            loader.signals.loaded.connect(self._on_thumb_loaded)
+            self._pool.start(loader)
+        self.load_progress.emit(self._loaded_count, len(self._queued))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._queue_visible_thumbs()
 
     # ── selection helpers (mirror filmstrip API) ──────────────────────────────
 
@@ -256,6 +393,8 @@ class GridViewWidget(QListWidget):
     # ── private slots ─────────────────────────────────────────────────────────
 
     def _on_thumb_loaded(self, path_str: str, qimg: QImage):
+        self._loaded_count += 1
+        self.load_progress.emit(self._loaded_count, len(self._queued))
         row = self._path_to_row.get(path_str)
         if row is None:
             return

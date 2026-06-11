@@ -1,9 +1,27 @@
+import hashlib
+import io
 import json
+import os
+import shutil
 import struct
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 from PIL import Image
+
+# macOS ImageIO via `sips` — hardware-accelerated HEIF/HEIC decode, far faster
+# and far cooler than libde265 software decoding in pillow-heif.
+_SIPS = shutil.which("sips")
+
+# Native Apple ImageIO (PyObjC). Same hardware decoder Finder/Photos use, but
+# called directly — no subprocess, no temp file — and it applies EXIF
+# orientation. Preferred over `sips` whenever available.
+try:
+    import Quartz  # from pyobjc-framework-Quartz
+    _IMAGEIO = True
+except Exception:
+    _IMAGEIO = False
 
 _heif_available = False
 _rawpy_available = False
@@ -32,6 +50,49 @@ _BASE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 _HEIC_EXTS = {".heic", ".heif", ".hif"}
 _RAW_EXTS  = {".nef", ".cr2", ".cr3", ".arw", ".dng", ".orf", ".rw2", ".raw", ".raf", ".pef"}
 
+# Disk thumbnail cache — keyed by (absolute_path, mtime_ns) so stale entries
+# are simply orphaned and never re-read.
+_CACHE_DIR: Optional[Path] = None
+try:
+    _c = Path.home() / ".cache" / "sorting-tool-thumbs"
+    _c.mkdir(parents=True, exist_ok=True)
+    _CACHE_DIR = _c
+except Exception:
+    pass
+
+
+def cache_info() -> Tuple[int, int]:
+    """Return (file_count, total_bytes) for the on-disk thumbnail cache."""
+    if _CACHE_DIR is None or not _CACHE_DIR.exists():
+        return (0, 0)
+    count = 0
+    total = 0
+    for f in _CACHE_DIR.glob("*.jpg"):
+        try:
+            total += f.stat().st_size
+            count += 1
+        except OSError:
+            pass
+    return (count, total)
+
+
+def clear_cache() -> Tuple[int, int]:
+    """Delete every cached thumbnail. Returns (files_removed, bytes_freed).
+    Safe at any time — thumbnails are regenerated from the originals on demand."""
+    if _CACHE_DIR is None or not _CACHE_DIR.exists():
+        return (0, 0)
+    removed = 0
+    freed = 0
+    for f in _CACHE_DIR.glob("*.jpg"):
+        try:
+            size = f.stat().st_size
+            f.unlink()
+            removed += 1
+            freed += size
+        except OSError:
+            pass
+    return (removed, freed)
+
 
 # ── public image-loading API (unchanged) ──────────────────────────────────────
 
@@ -44,10 +105,33 @@ def supported_extensions() -> set:
     return exts
 
 
-def scan_folder(folder: Path) -> list:
+# File-type groups for the type filter. JPEG is split out from the rest of the
+# base formats so it can be selected on its own (Fuji shoots RAW+JPEG / HIF+JPEG).
+FILE_TYPE_GROUPS: Dict[str, set] = {
+    "raw":  set(_RAW_EXTS),
+    "jpeg": {".jpg", ".jpeg"},
+    "hif":  set(_HEIC_EXTS),
+}
+
+
+def scan_folder(folder: Path, recursive: bool = False) -> list:
     exts = supported_extensions()
-    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts]
+    if recursive:
+        files = [f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in exts]
+    else:
+        files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts]
     return sorted(files, key=lambda p: p.name.lower())
+
+
+def has_image_subfolders(folder: Path) -> bool:
+    """Return True if folder has any subdirectory containing images."""
+    exts = supported_extensions()
+    for sub in folder.iterdir():
+        if sub.is_dir():
+            for f in sub.iterdir():
+                if f.is_file() and f.suffix.lower() in exts:
+                    return True
+    return False
 
 
 def _to_rgb(img: Image.Image) -> Image.Image:
@@ -74,10 +158,24 @@ def load_full(path: Path) -> Optional[Image.Image]:
         return None
 
 
-def load_thumbnail(path: Path, size: Tuple[int, int] = (200, 150)) -> Optional[Image.Image]:
-    ext = path.suffix.lower()
-    if ext in _RAW_EXTS and _rawpy_available:
-        import io
+def _thumb_cache_path(source: Path) -> Optional[Path]:
+    if _CACHE_DIR is None:
+        return None
+    try:
+        mtime_ns = source.stat().st_mtime_ns
+    except OSError:
+        return None
+    # The version suffix invalidates thumbnails cached by older code (e.g. the
+    # pre-ImageIO path that didn't apply EXIF orientation → sideways portraits).
+    key = f"{source.resolve()}:{mtime_ns}:v2"
+    h = hashlib.md5(key.encode()).hexdigest()
+    return _CACHE_DIR / f"{h}.jpg"
+
+
+def _load_heic_thumbnail(path: Path, size: Tuple[int, int]) -> Optional[Image.Image]:
+    """Extract the embedded JPEG preview from HIF/HEIC rather than doing a full decode."""
+    # Fujifilm HIF: LibRaw can extract the embedded full-size JPEG preview
+    if _rawpy_available:
         try:
             import rawpy
             with rawpy.imread(str(path)) as raw:
@@ -90,6 +188,183 @@ def load_thumbnail(path: Path, size: Tuple[int, int] = (200, 150)) -> Optional[I
                 return _to_rgb(img)
         except Exception:
             pass
+    # Fallback: exiftool can pull the embedded PreviewImage JPEG
+    if _EXIFTOOL:
+        try:
+            r = subprocess.run(
+                ["exiftool", "-b", "-PreviewImage", str(path)],
+                capture_output=True, timeout=15,
+            )
+            if r.returncode == 0 and len(r.stdout) > 500:
+                img = Image.open(io.BytesIO(r.stdout))
+                img.thumbnail(size, Image.LANCZOS)
+                return _to_rgb(img)
+        except Exception:
+            pass
+    return None
+
+
+def load_thumbnail_cached(path: Path, size: Tuple[int, int] = (400, 400)) -> Optional[Image.Image]:
+    """Load a thumbnail, serving from disk cache when available."""
+    cache_path = _thumb_cache_path(path)
+    if cache_path is not None and cache_path.exists():
+        try:
+            img = Image.open(str(cache_path))
+            img.load()
+            return img
+        except Exception:
+            cache_path.unlink(missing_ok=True)
+
+    img = load_thumbnail(path, size)
+    if img is not None and cache_path is not None:
+        try:
+            img.convert("RGB").save(str(cache_path), "JPEG", quality=85, optimize=True)
+        except Exception:
+            pass
+    return img
+
+
+def get_cached_thumbnail(path: Path) -> Optional[Image.Image]:
+    """Return the on-disk cached thumbnail only if it already exists — never builds
+    one. Used for instant low-res placeholders while the full preview loads."""
+    cache_path = _thumb_cache_path(path)
+    if cache_path is not None and cache_path.exists():
+        try:
+            img = Image.open(str(cache_path))
+            img.load()
+            return img
+        except Exception:
+            pass
+    return None
+
+
+def _imageio_decode(path: Path, max_dim: int) -> Optional[Image.Image]:
+    """Decode + downscale + orient via Apple ImageIO (hardware-accelerated).
+
+    Returns an upright RGB PIL image whose longest side is <= max_dim, or None
+    if ImageIO is unavailable or can't read the file. No subprocess, no temp
+    file — it decodes straight into a memory bitmap."""
+    if not _IMAGEIO:
+        return None
+    try:
+        url = Quartz.CFURLCreateWithFileSystemPath(
+            None, str(path), Quartz.kCFURLPOSIXPathStyle, False)
+        src = Quartz.CGImageSourceCreateWithURL(url, None)
+        if src is None:
+            return None
+        opts = {
+            Quartz.kCGImageSourceCreateThumbnailFromImageAlways: True,
+            Quartz.kCGImageSourceThumbnailMaxPixelSize: int(max_dim),
+            Quartz.kCGImageSourceCreateThumbnailWithTransform: True,  # apply orientation
+        }
+        cg = Quartz.CGImageSourceCreateThumbnailAtIndex(src, 0, opts)
+        if cg is None:
+            return None
+        w = int(Quartz.CGImageGetWidth(cg))
+        h = int(Quartz.CGImageGetHeight(cg))
+        if w <= 0 or h <= 0:
+            return None
+        cs = Quartz.CGColorSpaceCreateDeviceRGB()
+        # Own the backing buffer so there is no dangling pointer to free memory.
+        buffer = bytearray(w * h * 4)
+        ctx = Quartz.CGBitmapContextCreate(
+            buffer, w, h, 8, w * 4, cs,
+            Quartz.kCGImageAlphaNoneSkipLast | Quartz.kCGBitmapByteOrder32Big)
+        if ctx is None:
+            return None
+        Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, w, h), cg)
+        img = Image.frombuffer("RGB", (w, h), bytes(buffer), "raw", "RGBX", 0, 1)
+        # frombuffer reports mode "RGBX"; hand back a plain RGB image.
+        return img if img.mode == "RGB" else img.convert("RGB")
+    except Exception:
+        return None
+
+
+def _sips_decode(path: Path, max_dim: int) -> Optional[Image.Image]:
+    """Decode (and downscale) via macOS `sips` to a temp JPEG. Hardware-accelerated.
+    Fallback only — does not apply EXIF orientation."""
+    if not _SIPS:
+        return None
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        r = subprocess.run(
+            [_SIPS, "-Z", str(max_dim), "-s", "format", "jpeg",
+             str(path), "--out", tmp],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode == 0:
+            img = Image.open(tmp)
+            img.load()
+            return img
+    except Exception:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return None
+
+
+def _apply_orientation(img: Image.Image) -> Image.Image:
+    """Apply the EXIF orientation tag (rotate/flip) so the image is upright."""
+    try:
+        from PIL import ImageOps
+        return ImageOps.exif_transpose(img)
+    except Exception:
+        return img
+
+
+def load_preview(path: Path, max_dim: int = 2560) -> Optional[Image.Image]:
+    """Fit-to-window quality image for the detail viewer.
+
+    The viewer has no zoom — it always scales to fit — so a capped-resolution
+    preview is visually lossless while being dramatically faster than a full
+    decode. HEIF/HEIC go through Apple ImageIO (hardware-accelerated, upright)."""
+    ext = path.suffix.lower()
+    if ext in _HEIC_EXTS:
+        img = _imageio_decode(path, max_dim)   # fast + correct orientation
+        if img is not None:
+            return img
+        img = _sips_decode(path, max_dim)       # fallback
+        if img is not None:
+            return _apply_orientation(_to_rgb(img))
+    img = load_full(path)
+    if img is not None:
+        if ext in _HEIC_EXTS:
+            img = _apply_orientation(img)
+        if max(img.size) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+    return img
+
+
+def load_thumbnail(path: Path, size: Tuple[int, int] = (200, 150)) -> Optional[Image.Image]:
+    ext = path.suffix.lower()
+    if ext in _RAW_EXTS and _rawpy_available:
+        try:
+            import rawpy
+            with rawpy.imread(str(path)) as raw:
+                thumb = raw.extract_thumb()
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    img = Image.open(io.BytesIO(thumb.data))
+                else:
+                    img = Image.fromarray(thumb.data)
+                img.thumbnail(size, Image.LANCZOS)
+                return _to_rgb(img)
+        except Exception:
+            pass
+    if ext in _HEIC_EXTS:
+        # ImageIO first: hardware-fast AND applies orientation (so portrait
+        # HEIC thumbnails aren't shown sideways).
+        img = _imageio_decode(path, max(size))
+        if img is not None:
+            return img
+        img = _load_heic_thumbnail(path, size)
+        if img is not None:
+            return img
     try:
         img = Image.open(str(path))
         img.thumbnail(size, Image.LANCZOS)
@@ -133,6 +408,7 @@ def optional_support_info() -> str:
     parts.append("HEIC ✓" if _heif_available else "HEIC ✗ (pip install pillow-heif)")
     parts.append("RAW ✓"  if _rawpy_available  else "RAW ✗ (pip install rawpy + brew install libraw)")
     parts.append("exiftool ✓" if _EXIFTOOL else "exiftool ✗ (brew install exiftool — needed for film simulation)")
+    parts.append("ImageIO ✓" if _IMAGEIO else "ImageIO ✗ (pip install pyobjc-framework-Quartz — faster HEIC)")
     return "  |  ".join(parts)
 
 
