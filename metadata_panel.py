@@ -25,15 +25,15 @@ class _MetaWorker(QObject):
 
 # ── section/field layout helpers ─────────────────────────────────────────────
 
-_SECTION_STYLE = "color: #888; font-size: 9px; letter-spacing: 1.2px; margin-top: 10px; margin-bottom: 2px;"
-_KEY_STYLE     = "color: #666; font-size: 9px;"
-_VAL_STYLE     = "color: #ddd; font-size: 11px; word-wrap: break-all;"
+_SECTION_STYLE = "color: rgba(235,235,245,0.4); font-size: 9px; letter-spacing: 1.2px; margin-top: 10px; margin-bottom: 2px;"
+_KEY_STYLE     = "color: rgba(235,235,245,0.35); font-size: 9px;"
+_VAL_STYLE     = "color: rgba(235,235,245,0.85); font-size: 11px; word-wrap: break-all;"
 
 _LABEL_COLORS = {
-    "red": "#c0392b", "yellow": "#d4ac0d", "green": "#1e8449",
-    "blue": "#1a5276", "purple": "#6c3483",
+    "red": "#FF453A", "yellow": "#FFD60A", "green": "#30D158",
+    "blue": "#0A84FF", "purple": "#BF5AF2",
 }
-_FLAG_COLORS = {"pick": "#3498db", "reject": "#e74c3c", "unflagged": "#555"}
+_FLAG_COLORS = {"pick": "#30D158", "reject": "#FF453A", "unflagged": "#48484A"}
 
 
 def _section_label(text: str) -> QLabel:
@@ -46,7 +46,7 @@ def _section_label(text: str) -> QLabel:
 def _divider() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet("color: #2a2a2a; margin: 0;")
+    line.setStyleSheet("color: #3A3A3C; margin: 0;")
     return line
 
 
@@ -76,7 +76,7 @@ class MetadataPanelWidget(QWidget):
         self.setMinimumWidth(220)
         self.setMaximumWidth(320)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("background: #141414;")
+        self.setStyleSheet("background: #1C1C1E;")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -86,8 +86,8 @@ class MetadataPanelWidget(QWidget):
         header = QLabel("  INFO")
         header.setFixedHeight(26)
         header.setStyleSheet(
-            "background: #1a1a1a; color: #777; font-size: 9px; "
-            "letter-spacing: 1.5px; border-bottom: 1px solid #2a2a2a;"
+            "background: #2C2C2E; color: rgba(235,235,245,0.4); font-size: 9px; "
+            "letter-spacing: 1.5px; border-bottom: 1px solid #3A3A3C;"
         )
         outer.addWidget(header)
 
@@ -97,19 +97,19 @@ class MetadataPanelWidget(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setStyleSheet("""
-            QScrollArea { border: none; background: #141414; }
+            QScrollArea { border: none; background: #1C1C1E; }
             QScrollBar:vertical {
-                background: #1a1a1a; width: 6px; margin: 0;
+                background: #2C2C2E; width: 6px; margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: #3a3a3a; border-radius: 3px; min-height: 20px;
+                background: #48484A; border-radius: 3px; min-height: 20px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
         outer.addWidget(scroll, 1)
 
         self._content = QWidget()
-        self._content.setStyleSheet("background: #141414;")
+        self._content.setStyleSheet("background: #1C1C1E;")
         self._layout = QVBoxLayout(self._content)
         self._layout.setContentsMargins(10, 6, 10, 16)
         self._layout.setSpacing(0)
@@ -122,7 +122,7 @@ class MetadataPanelWidget(QWidget):
         self._last_meta: Dict = {}
 
         self._loading_label = QLabel("Loading…")
-        self._loading_label.setStyleSheet("color: #444; font-size: 11px; padding: 16px;")
+        self._loading_label.setStyleSheet("color: rgba(235,235,245,0.25); font-size: 11px; padding: 16px;")
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -324,7 +324,7 @@ class MetadataPanelWidget(QWidget):
         sr_layout.setSpacing(1)
         for i in range(5):
             s = QLabel("★" if i < rating else "☆")
-            s.setStyleSheet(f"color: {'#d4ac0d' if i < rating else '#333'}; font-size: 14px;")
+            s.setStyleSheet(f"color: {'#FFD60A' if i < rating else '#48484A'}; font-size: 14px;")
             sr_layout.addWidget(s)
         sr_layout.addStretch()
         self._layout.addWidget(stars_row)
@@ -349,5 +349,5 @@ class MetadataPanelWidget(QWidget):
             )
         else:
             color_v = QLabel("None")
-            color_v.setStyleSheet("color: #444; font-size: 11px; margin-bottom: 4px;")
+            color_v.setStyleSheet("color: rgba(235,235,245,0.2); font-size: 11px; margin-bottom: 4px;")
         self._layout.addWidget(color_v)

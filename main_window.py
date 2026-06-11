@@ -15,11 +15,13 @@ from PyQt6.QtGui import (QKeySequence, QShortcut, QAction, QFont,
                           QColor, QPalette)
 
 from metadata import MetadataStore
-from image_loader import scan_folder, get_exif, optional_support_info
+from image_loader import (scan_folder, get_exif, optional_support_info,
+                          cache_info, clear_cache, FILE_TYPE_GROUPS)
 from image_viewer import ImageViewerWidget
 from filmstrip import FilmstripWidget
 from sidebar import SidebarWidget
 from grid_view import GridViewWidget, THUMB_MIN, THUMB_MAX, THUMB_DEFAULT
+from loading_overlay import LoadingOverlay
 from metadata_panel import MetadataPanelWidget
 from collections_store import CollectionsStore
 from rename_dialog import BatchRenameDialog
@@ -31,7 +33,7 @@ class HelpDialog(QDialog):
         self.setWindowTitle("Keyboard Shortcuts")
         self.setModal(True)
         self.setFixedSize(560, 500)
-        self.setStyleSheet("background: #1e1e1e; color: #ccc;")
+        self.setStyleSheet("background: #1C1C1E; color: rgba(235,235,245,0.85);")
 
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
@@ -80,6 +82,8 @@ class HelpDialog(QDialog):
                 ("?",          "Show this help"),
                 ("⌘F",         "Toggle filmstrip"),
                 ("⌘B",         "Toggle sidebar"),
+                ("[",          "Rotate left"),
+                ("]",          "Rotate right"),
             ]),
         ]
 
@@ -105,16 +109,16 @@ class HelpDialog(QDialog):
                 row += 1
             section_label = QLabel(section.upper())
             section_label.setFont(section_font)
-            section_label.setStyleSheet("color: #666;")
+            section_label.setStyleSheet("color: rgba(235,235,245,0.4);")
             grid.addWidget(section_label, row, 0, 1, 2)
             row += 1
             for key, desc in items:
                 k = QLabel(key)
                 k.setFont(key_font)
-                k.setStyleSheet("color: #aaa; background: #2a2a2a; padding: 2px 6px; border-radius: 3px;")
+                k.setStyleSheet("color: rgba(235,235,245,0.85); background: #2C2C2E; padding: 2px 6px; border-radius: 4px;")
                 k.setFixedWidth(90)
                 d = QLabel(desc)
-                d.setStyleSheet("color: #ccc;")
+                d.setStyleSheet("color: rgba(235,235,245,0.7);")
                 grid.addWidget(k, row, 0, Qt.AlignmentFlag.AlignLeft)
                 grid.addWidget(d, row, 1)
                 row += 1
@@ -123,7 +127,7 @@ class HelpDialog(QDialog):
         layout.addStretch()
 
         close_hint = QLabel("Press any key or click to close")
-        close_hint.setStyleSheet("color: #555; font-size: 11px;")
+        close_hint.setStyleSheet("color: rgba(235,235,245,0.3); font-size: 11px;")
         close_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(close_hint)
 
@@ -154,6 +158,7 @@ class MainWindow(QMainWindow):
         self._filter_rating = 0
         self._filter_flag = "all"
         self._filter_label = "all"
+        self._filter_types: Optional[set] = None   # None = all file types
         self._sort_by = "filename"
         self._sort_asc = True
 
@@ -197,7 +202,7 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(2)
-        splitter.setStyleSheet("QSplitter::handle { background: #333; }")
+        splitter.setStyleSheet("QSplitter::handle { background: #3A3A3C; }")
 
         self._sidebar = SidebarWidget()
         self._sidebar.move_requested.connect(self._move_to_album)
@@ -217,7 +222,7 @@ class MainWindow(QMainWindow):
         # Horizontal splitter: viewer (left) | meta panel (right)
         self._detail_hsplit = QSplitter(Qt.Orientation.Horizontal)
         self._detail_hsplit.setHandleWidth(2)
-        self._detail_hsplit.setStyleSheet("QSplitter::handle { background: #2a2a2a; }")
+        self._detail_hsplit.setStyleSheet("QSplitter::handle { background: #3A3A3C; }")
 
         self._viewer = ImageViewerWidget()
         self._detail_hsplit.addWidget(self._viewer)
@@ -234,6 +239,8 @@ class MainWindow(QMainWindow):
         self._filmstrip = FilmstripWidget()
         self._filmstrip.image_selected.connect(self._on_filmstrip_select)
         self._filmstrip.selection_changed.connect(self._update_status)
+        self._filmstrip.load_progress.connect(
+            lambda l, t: self._on_load_progress(l, t, 0))
         detail_layout.addWidget(self._filmstrip)
 
         self._stack.addWidget(detail_widget)  # index 0
@@ -243,7 +250,12 @@ class MainWindow(QMainWindow):
         self._grid.image_selected.connect(self._on_grid_select)
         self._grid.selection_changed.connect(self._update_status)
         self._grid.open_detail.connect(self._on_open_detail)
+        self._grid.load_progress.connect(
+            lambda l, t: self._on_load_progress(l, t, 1))
         self._stack.addWidget(self._grid)     # index 1
+
+        # Floating loading indicator, on top of whichever view is active
+        self._loading_overlay = LoadingOverlay(self._stack)
 
         splitter.addWidget(self._stack)
         splitter.setSizes([200, 1240])
@@ -255,7 +267,7 @@ class MainWindow(QMainWindow):
 
         # Status bar
         sb = QStatusBar()
-        sb.setStyleSheet("QStatusBar { background: #1a1a1a; color: #999; font-size: 11px; border-top: 1px solid #333; } QStatusBar::item { border: none; }")
+        sb.setStyleSheet("QStatusBar { background: #1C1C1E; color: rgba(235,235,245,0.45); font-size: 11px; border-top: 1px solid #3A3A3C; } QStatusBar::item { border: none; }")
         self.setStatusBar(sb)
         self._status_left = QLabel()
         self._status_right = QLabel()
@@ -266,7 +278,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         mb = self.menuBar()
-        mb.setStyleSheet("QMenuBar { background: #1e1e1e; color: #ccc; } QMenuBar::item:selected { background: #333; } QMenu { background: #252525; color: #ccc; border: 1px solid #444; } QMenu::item:selected { background: #2a4060; }")
+        mb.setStyleSheet("QMenuBar { background: #1C1C1E; color: rgba(235,235,245,0.85); } QMenuBar::item:selected { background: #3A3A3C; } QMenu { background: #2C2C2E; color: rgba(235,235,245,0.85); border: 1px solid rgba(255,255,255,0.12); } QMenu::item:selected { background: #0A84FF; color: white; }")
 
         file_menu = mb.addMenu("File")
         open_act = QAction("Open Folder…", self)
@@ -284,6 +296,11 @@ class MainWindow(QMainWindow):
         undo_act.triggered.connect(self._undo_move)
         file_menu.addAction(undo_act)
 
+        file_menu.addSeparator()
+        clear_cache_act = QAction("Clear Thumbnail Cache…", self)
+        clear_cache_act.triggered.connect(self._clear_thumbnail_cache)
+        file_menu.addAction(clear_cache_act)
+
         view_menu = mb.addMenu("View")
         toggle_film = QAction("Toggle Filmstrip", self)
         toggle_film.setShortcut("Ctrl+F")
@@ -293,6 +310,16 @@ class MainWindow(QMainWindow):
         toggle_side.setShortcut("Ctrl+B")
         toggle_side.triggered.connect(self._toggle_sidebar)
         view_menu.addAction(toggle_side)
+
+        view_menu.addSeparator()
+        rot_left_act = QAction("Rotate Left", self)
+        rot_left_act.setShortcut("[")
+        rot_left_act.triggered.connect(self._rotate_left)
+        view_menu.addAction(rot_left_act)
+        rot_right_act = QAction("Rotate Right", self)
+        rot_right_act.setShortcut("]")
+        rot_right_act.triggered.connect(self._rotate_right)
+        view_menu.addAction(rot_right_act)
 
         help_menu = mb.addMenu("Help")
         shortcuts_act = QAction("Keyboard Shortcuts", self)
@@ -308,18 +335,18 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.setFloatable(False)
         tb.setStyleSheet("""
-            QToolBar { background: #1e1e1e; border-bottom: 1px solid #333; padding: 4px 8px; spacing: 6px; }
-            QLabel { color: #999; font-size: 11px; }
+            QToolBar { background: #1C1C1E; border-bottom: 1px solid #3A3A3C; padding: 4px 8px; spacing: 6px; }
+            QLabel { color: rgba(235,235,245,0.5); font-size: 11px; }
             QComboBox {
-                background: #2a2a2a; color: #ccc; border: 1px solid #444;
-                border-radius: 3px; padding: 2px 6px; font-size: 11px; min-width: 90px;
+                background: #2C2C2E; color: rgba(235,235,245,0.85); border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 7px; padding: 2px 8px; font-size: 11px; min-width: 90px;
             }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background: #252525; color: #ccc; border: 1px solid #555;
-                selection-background-color: #2a4060;
+                background: #2C2C2E; color: rgba(235,235,245,0.85); border: 1px solid rgba(255,255,255,0.12);
+                selection-background-color: #0A84FF;
             }
-            QCheckBox { color: #aaa; font-size: 11px; }
+            QCheckBox { color: rgba(235,235,245,0.7); font-size: 11px; }
         """)
         self.addToolBar(tb)
 
@@ -340,6 +367,13 @@ class MainWindow(QMainWindow):
         self._label_combo.addItems(["All", "Red", "Yellow", "Green", "Blue", "Purple"])
         self._label_combo.currentIndexChanged.connect(self._on_filter_change)
         tb.addWidget(self._label_combo)
+
+        tb.addWidget(QLabel("  Type:"))
+        self._type_combo = QComboBox()
+        self._type_combo.addItems(["All Types", "RAW", "JPEG", "HIF / HEIC",
+                                   "RAW + JPEG", "RAW + HIF", "HIF + JPEG"])
+        self._type_combo.currentIndexChanged.connect(self._on_filter_change)
+        tb.addWidget(self._type_combo)
 
         spacer = QWidget()
         spacer.setMinimumWidth(20)
@@ -364,13 +398,13 @@ class MainWindow(QMainWindow):
         self._auto_advance_btn.setCheckable(True)
         self._auto_advance_btn.setStyleSheet("""
             QPushButton {
-                background: #2e2e2e; color: #ccc; border: 1px solid #555;
-                border-radius: 3px; padding: 3px 8px; font-size: 11px;
+                background: #2C2C2E; color: rgba(235,235,245,0.7); border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 7px; padding: 3px 10px; font-size: 11px;
             }
             QPushButton:checked {
-                background: #404010; color: #ffd; border-color: #808040;
+                background: rgba(10,132,255,0.22); color: #0A84FF; border-color: rgba(10,132,255,0.45);
             }
-            QPushButton:hover:!checked { background: #3a3a3a; }
+            QPushButton:hover:!checked { background: #3A3A3C; }
         """)
         tb.addWidget(self._auto_advance_btn)
 
@@ -379,8 +413,8 @@ class MainWindow(QMainWindow):
         # Collection mode badge (hidden by default)
         self._coll_badge_label = QLabel("")
         self._coll_badge_label.setStyleSheet(
-            "color: #ffd; background: #2a4020; border: 1px solid #4a6030; "
-            "border-radius: 3px; padding: 2px 6px; font-size: 11px;"
+            "color: white; background: #0A84FF; border: none; "
+            "border-radius: 7px; padding: 2px 8px; font-size: 11px;"
         )
         self._coll_badge_label.setVisible(False)
         tb.addWidget(self._coll_badge_label)
@@ -391,10 +425,10 @@ class MainWindow(QMainWindow):
         self._coll_exit_btn.setFixedWidth(22)
         self._coll_exit_btn.setStyleSheet("""
             QPushButton {
-                background: #3a3030; color: #faa; border: 1px solid #644;
-                border-radius: 3px; padding: 0px 3px; font-size: 13px; font-weight: bold;
+                background: rgba(255,69,58,0.18); color: #FF453A; border: 1px solid rgba(255,69,58,0.3);
+                border-radius: 5px; padding: 0px 3px; font-size: 13px; font-weight: bold;
             }
-            QPushButton:hover { background: #5a4040; }
+            QPushButton:hover { background: rgba(255,69,58,0.32); }
         """)
         self._coll_exit_btn.clicked.connect(self._exit_collection_mode)
         tb.addWidget(self._coll_exit_btn)
@@ -412,14 +446,14 @@ class MainWindow(QMainWindow):
         self._size_slider.valueChanged.connect(self._on_grid_size_change)
         self._size_slider.setStyleSheet("""
             QSlider::groove:horizontal {
-                background: #333; height: 4px; border-radius: 2px;
+                background: #3A3A3C; height: 4px; border-radius: 2px;
             }
             QSlider::handle:horizontal {
-                background: #888; width: 12px; height: 12px;
-                margin: -4px 0; border-radius: 6px;
+                background: #AEAEB2; width: 14px; height: 14px;
+                margin: -5px 0; border-radius: 7px;
             }
-            QSlider::handle:horizontal:hover { background: #aaa; }
-            QSlider::sub-page:horizontal { background: #4a80c0; border-radius: 2px; }
+            QSlider::handle:horizontal:hover { background: white; }
+            QSlider::sub-page:horizontal { background: #0A84FF; border-radius: 2px; }
         """)
         tb.addWidget(self._size_slider)
 
@@ -431,13 +465,13 @@ class MainWindow(QMainWindow):
         self._view_btn.setCheckable(True)
         self._view_btn.setStyleSheet("""
             QPushButton {
-                background: #2e2e2e; color: #ccc; border: 1px solid #555;
-                border-radius: 3px; padding: 3px 10px; font-size: 11px;
+                background: #2C2C2E; color: rgba(235,235,245,0.7); border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 7px; padding: 3px 10px; font-size: 11px;
             }
             QPushButton:checked {
-                background: #1a4080; color: #fff; border-color: #2060b0;
+                background: #0A84FF; color: #ffffff; border-color: #0A84FF;
             }
-            QPushButton:hover:!checked { background: #3a3a3a; }
+            QPushButton:hover:!checked { background: #3A3A3C; }
         """)
         self._view_btn.clicked.connect(self._toggle_view)
         tb.addWidget(self._view_btn)
@@ -447,7 +481,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(right_spacer)
 
         self._count_label = QLabel("")
-        self._count_label.setStyleSheet("color: #666; font-size: 11px;")
+        self._count_label.setStyleSheet("color: rgba(235,235,245,0.35); font-size: 11px;")
         tb.addWidget(self._count_label)
 
     def _build_shortcuts(self):
@@ -475,6 +509,7 @@ class MainWindow(QMainWindow):
         sc("`", lambda: self._toggle_label("purple"))
         sc("m",         self._move_shortcut)
         sc("c",         self._add_to_collection)
+        # [ and ] are bound via the View-menu actions (Rotate Left/Right)
         sc("Ctrl+A",    self._select_all)
         sc("g",         self._toggle_view)
         sc("i",         self._toggle_info_panel)
@@ -491,6 +526,27 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Open Folder", start)
         if folder:
             self._open_folder(Path(folder))
+
+    def _clear_thumbnail_cache(self):
+        count, total = cache_info()
+        if count == 0:
+            QMessageBox.information(self, "Thumbnail Cache",
+                                    "The thumbnail cache is already empty.")
+            return
+        mb = total / (1024 * 1024)
+        resp = QMessageBox.question(
+            self, "Clear Thumbnail Cache",
+            f"Delete {count:,} cached thumbnails ({mb:.1f} MB)?\n\n"
+            "Your photos are not touched — thumbnails are rebuilt from the "
+            "originals as you browse.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        removed, freed = clear_cache()
+        self._status_left.setText(
+            f"Cleared {removed:,} cached thumbnails ({freed / (1024*1024):.1f} MB freed).")
 
     def _open_folder(self, path: Path):
         self._folder = path
@@ -533,6 +589,8 @@ class MainWindow(QMainWindow):
             images = [p for p in images if self._metadata.get_flag(p) == self._filter_flag]
         if self._filter_label != "all":
             images = [p for p in images if self._metadata.get_color_label(p) == self._filter_label]
+        if self._filter_types is not None:
+            images = [p for p in images if p.suffix.lower() in self._filter_types]
 
         sort_key = self._sort_by
         rev = not self._sort_asc
@@ -566,8 +624,13 @@ class MainWindow(QMainWindow):
         self._index = index
         path = self._filtered[index]
         self._viewer.load_image(path)
+        # Prefetch neighbours (next first) so arrow-key navigation feels instant.
+        neighbours = [self._filtered[index + off]
+                      for off in (1, -1, 2, -2, 3)
+                      if 0 <= index + off < len(self._filtered)]
+        self._viewer.prefetch(neighbours)
         meta = self._metadata.get(path)
-        self._viewer.set_metadata(meta.get("rating", 0), meta.get("color_label"), meta.get("flag", "unflagged"))
+        self._viewer.set_metadata(meta.get("rating", 0), meta.get("color_label"), meta.get("flag", "unflagged"), meta.get("rotation", 0))
         self._filmstrip.select_row(index)
         if self._stack.currentIndex() == 1:
             self._grid.select_row(index)
@@ -604,7 +667,7 @@ class MainWindow(QMainWindow):
         if not p:
             return
         meta = self._metadata.get(p)
-        self._viewer.set_metadata(meta.get("rating", 0), meta.get("color_label"), meta.get("flag", "unflagged"))
+        self._viewer.set_metadata(meta.get("rating", 0), meta.get("color_label"), meta.get("flag", "unflagged"), meta.get("rotation", 0))
         self._filmstrip.update_item_metadata(p, self._metadata)
         self._grid.update_item_metadata(p, self._metadata)
         if self._meta_panel.isVisible():
@@ -658,6 +721,25 @@ class MainWindow(QMainWindow):
         self._metadata.set_color_label(p, None if cur == color else color)
         self._refresh_current()
 
+    def _rotate(self, delta: int):
+        """Rotate the current image (or, in grid view, every selected image)."""
+        if self._stack.currentIndex() == 1:
+            targets = self._grid.selected_paths() or ([self._current_path] if self._current_path else [])
+        else:
+            targets = [self._current_path] if self._current_path else []
+        for p in targets:
+            if p:
+                self._metadata.rotate(p, delta)
+                self._filmstrip.update_item_metadata(p, self._metadata)
+                self._grid.update_item_metadata(p, self._metadata)
+        self._refresh_current()
+
+    def _rotate_left(self):
+        self._rotate(-90)
+
+    def _rotate_right(self):
+        self._rotate(90)
+
     # ──────────────────────────── move / copy ────────────────────────────────
 
     def _move_shortcut(self):
@@ -683,7 +765,7 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Move Images" if count > 1 else "Move Image")
-        dlg.setStyleSheet("QDialog { background: #252525; color: #ccc; } QLabel { color: #ccc; } QCheckBox { color: #ccc; }")
+        dlg.setStyleSheet("QDialog { background: #1C1C1E; color: rgba(235,235,245,0.85); } QLabel { color: rgba(235,235,245,0.85); } QCheckBox { color: rgba(235,235,245,0.85); }")
         dlg_layout = QVBoxLayout(dlg)
         dlg_layout.setContentsMargins(20, 16, 20, 14)
         dlg_layout.setSpacing(10)
@@ -699,10 +781,10 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet("QPushButton { background: #2e2e2e; color: #ccc; border: 1px solid #444; border-radius: 3px; padding: 5px 14px; } QPushButton:hover { background: #3a3a3a; }")
+        cancel_btn.setStyleSheet("QPushButton { background: #2C2C2E; color: rgba(235,235,245,0.85); border: 1px solid rgba(255,255,255,0.1); border-radius: 7px; padding: 5px 14px; } QPushButton:hover { background: #3A3A3C; }")
         cancel_btn.clicked.connect(dlg.reject)
         yes_btn = QPushButton("OK")
-        yes_btn.setStyleSheet("QPushButton { background: #1a4080; color: #fff; border: 1px solid #2060b0; border-radius: 3px; padding: 5px 14px; font-weight: bold; } QPushButton:hover { background: #1e50a0; }")
+        yes_btn.setStyleSheet("QPushButton { background: #0A84FF; color: #fff; border: none; border-radius: 7px; padding: 5px 14px; font-weight: bold; } QPushButton:hover { background: #1A94FF; }")
         yes_btn.clicked.connect(dlg.accept)
         yes_btn.setDefault(True)
         btn_row.addWidget(cancel_btn)
@@ -938,6 +1020,18 @@ class MainWindow(QMainWindow):
         self._filter_flag = flag_map.get(self._flag_combo.currentIndex(), "all")
         label_map = {0: "all", 1: "red", 2: "yellow", 3: "green", 4: "blue", 5: "purple"}
         self._filter_label = label_map.get(self._label_combo.currentIndex(), "all")
+        _raw, _jpeg, _hif = (FILE_TYPE_GROUPS["raw"], FILE_TYPE_GROUPS["jpeg"],
+                             FILE_TYPE_GROUPS["hif"])
+        type_map = {
+            0: None,                 # All Types
+            1: _raw,                 # RAW
+            2: _jpeg,                # JPEG
+            3: _hif,                 # HIF / HEIC
+            4: _raw | _jpeg,         # RAW + JPEG
+            5: _raw | _hif,          # RAW + HIF
+            6: _hif | _jpeg,         # HIF + JPEG
+        }
+        self._filter_types = type_map.get(self._type_combo.currentIndex())
         sort_map = {0: "filename", 1: "date", 2: "rating"}
         self._sort_by = sort_map.get(self._sort_combo.currentIndex(), "filename")
         self._sort_asc = self._sort_dir_combo.currentIndex() == 0
@@ -957,6 +1051,12 @@ class MainWindow(QMainWindow):
     def _on_filmstrip_select(self, row: int):
         if row != self._index:
             self._go_to(row)
+
+    def _on_load_progress(self, loaded: int, total: int, view_index: int):
+        # Only reflect progress for the view that's currently showing.
+        if self._stack.currentIndex() != view_index:
+            return
+        self._loading_overlay.set_progress(loaded, total)
 
     def _select_all(self):
         active = self._grid if self._stack.currentIndex() == 1 else self._filmstrip

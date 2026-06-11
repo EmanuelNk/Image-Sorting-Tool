@@ -11,102 +11,102 @@ from PyQt6.QtGui import QFont, QColor
 
 _BTN_STYLE = """
     QPushButton {
-        background: #2e2e2e;
-        color: #ccc;
-        border: 1px solid #444;
-        border-radius: 3px;
+        background: #2C2C2E;
+        color: rgba(235,235,245,0.7);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 6px;
         padding: 3px 6px;
         font-size: 11px;
     }
-    QPushButton:hover { background: #3a3a3a; }
-    QPushButton:pressed { background: #252525; }
-    QPushButton:disabled { background: #252525; color: #555; border-color: #333; }
+    QPushButton:hover { background: #3A3A3C; }
+    QPushButton:pressed { background: #1C1C1E; }
+    QPushButton:disabled { background: #1C1C1E; color: rgba(235,235,245,0.2); border-color: rgba(255,255,255,0.05); }
 """
 
 _MOVE_BTN_STYLE = """
     QPushButton {
-        background: #1a4080;
-        color: #fff;
-        border: 1px solid #2060b0;
-        border-radius: 3px;
+        background: #0A84FF;
+        color: #ffffff;
+        border: none;
+        border-radius: 7px;
         padding: 5px;
         font-size: 12px;
         font-weight: bold;
     }
-    QPushButton:hover { background: #1e50a0; }
-    QPushButton:pressed { background: #153060; }
+    QPushButton:hover { background: #1A94FF; }
+    QPushButton:pressed { background: #0060CC; }
     QPushButton:disabled {
-        background: #252525;
-        color: #555;
-        border-color: #333;
+        background: #2C2C2E;
+        color: rgba(235,235,245,0.2);
+        border: 1px solid rgba(255,255,255,0.05);
     }
 """
 
 _COPY_BTN_STYLE = """
     QPushButton {
-        background: #1a6040;
-        color: #fff;
-        border: 1px solid #20a060;
-        border-radius: 3px;
+        background: rgba(10,132,255,0.18);
+        color: #0A84FF;
+        border: 1px solid rgba(10,132,255,0.35);
+        border-radius: 7px;
         padding: 5px;
         font-size: 12px;
         font-weight: bold;
     }
-    QPushButton:hover { background: #1e7050; }
-    QPushButton:pressed { background: #154030; }
+    QPushButton:hover { background: rgba(10,132,255,0.28); }
+    QPushButton:pressed { background: rgba(10,132,255,0.12); }
     QPushButton:disabled {
-        background: #252525;
-        color: #555;
-        border-color: #333;
+        background: #2C2C2E;
+        color: rgba(235,235,245,0.2);
+        border: 1px solid rgba(255,255,255,0.05);
     }
 """
 
 _OPEN_BTN_STYLE = """
     QPushButton {
-        background: #1a4080;
-        color: #fff;
-        border: 1px solid #2060b0;
-        border-radius: 3px;
+        background: #0A84FF;
+        color: #ffffff;
+        border: none;
+        border-radius: 7px;
         padding: 5px;
         font-size: 12px;
         font-weight: bold;
     }
-    QPushButton:hover { background: #1e50a0; }
-    QPushButton:pressed { background: #153060; }
+    QPushButton:hover { background: #1A94FF; }
+    QPushButton:pressed { background: #0060CC; }
     QPushButton:disabled {
-        background: #252525;
-        color: #555;
-        border-color: #333;
+        background: #2C2C2E;
+        color: rgba(235,235,245,0.2);
+        border: 1px solid rgba(255,255,255,0.05);
     }
 """
 
 _ADD_COLL_BTN_STYLE = """
     QPushButton {
-        background: #2a5020;
-        color: #ccc;
-        border: 1px solid #3a6030;
-        border-radius: 3px;
+        background: rgba(48,209,88,0.15);
+        color: #30D158;
+        border: 1px solid rgba(48,209,88,0.3);
+        border-radius: 6px;
         padding: 4px 6px;
         font-size: 12px;
         font-weight: bold;
     }
-    QPushButton:hover { background: #3a6030; }
-    QPushButton:pressed { background: #1a4010; }
-    QPushButton:disabled { background: #252525; color: #555; border-color: #333; }
+    QPushButton:hover { background: rgba(48,209,88,0.25); }
+    QPushButton:pressed { background: rgba(48,209,88,0.1); }
+    QPushButton:disabled { background: #2C2C2E; color: rgba(235,235,245,0.2); border-color: rgba(255,255,255,0.05); }
 """
 
 _LIST_STYLE = """
     QListWidget {
-        background: #1e1e1e;
-        border: 1px solid #333;
-        border-radius: 4px;
-        color: #ccc;
+        background: #2C2C2E;
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 8px;
+        color: rgba(235,235,245,0.85);
         font-size: 12px;
         outline: none;
     }
-    QListWidget::item { padding: 4px 6px; }
-    QListWidget::item:selected { background: #2a4060; color: #fff; }
-    QListWidget::item:hover:!selected { background: #2a2a2a; }
+    QListWidget::item { padding: 5px 8px; }
+    QListWidget::item:selected { background: #0A84FF; color: #ffffff; }
+    QListWidget::item:hover:!selected { background: rgba(255,255,255,0.06); }
 """
 
 _SECTION_FONT_SIZE = 9
@@ -121,10 +121,10 @@ class SmartCollectionDialog(QDialog):
         self.setWindowTitle("New Smart Collection")
         self.setModal(True)
         self.setFixedWidth(380)
-        self.setStyleSheet("QDialog { background: #252525; color: #ccc; } "
-                           "QLabel { color: #ccc; } "
-                           "QLineEdit, QComboBox { background: #2a2a2a; color: #ccc; "
-                           "border: 1px solid #444; border-radius: 3px; padding: 3px 6px; }")
+        self.setStyleSheet("QDialog { background: #1C1C1E; color: rgba(235,235,245,0.85); } "
+                           "QLabel { color: rgba(235,235,245,0.85); } "
+                           "QLineEdit, QComboBox { background: #2C2C2E; color: rgba(235,235,245,0.85); "
+                           "border: 1px solid rgba(255,255,255,0.1); border-radius: 7px; padding: 3px 8px; }")
         self.rule: Optional[Dict] = None
         self._build()
 
@@ -212,6 +212,7 @@ class SidebarWidget(QWidget):
         super().__init__(parent)
         self.setFixedWidth(200)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet("SidebarWidget { background: #1C1C1E; }")
         self._albums: List[Path] = []
         self._collections: List[Dict[str, Any]] = []
         self._setup_ui()
@@ -223,13 +224,13 @@ class SidebarWidget(QWidget):
         f.setBold(True)
         f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
         lbl.setFont(f)
-        lbl.setStyleSheet("color: #777;")
+        lbl.setStyleSheet("color: rgba(235,235,245,0.4);")
         return lbl
 
     def _divider(self) -> QFrame:
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color: #333;")
+        sep.setStyleSheet("color: #3A3A3C;")
         return sep
 
     def _setup_ui(self):

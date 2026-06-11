@@ -3,8 +3,9 @@ from typing import Optional, List
 
 from PyQt6.QtWidgets import QScrollArea, QWidget, QHBoxLayout, QListWidget, QListWidgetItem
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QObject, pyqtSlot,
-                           QRunnable, QThreadPool, QSize, QRect)
-from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPen, QIcon
+                           QRunnable, QThreadPool, QSize, QRect, QRectF,
+                           QPoint, QTimer)
+from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPen, QIcon, QPainterPath, QTransform
 from PyQt6.QtWidgets import QStyledItemDelegate, QStyle
 
 from image_loader import load_thumbnail
@@ -55,65 +56,85 @@ class _Delegate(QStyledItemDelegate):
         return QSize(ITEM_W, ITEM_H)
 
     def paint(self, painter, option, index):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.save()
         r = option.rect
         thumb_r = QRect(r.x() + 3, r.y() + 3, THUMB_W, THUMB_H)
         bottom_r = QRect(r.x(), r.y() + THUMB_H + 3, r.width(), ITEM_H - THUMB_H - 3)
 
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        corner_r = 5
 
-        # Item background
-        painter.fillRect(r, QColor(22, 22, 22))
+        painter.fillRect(r, QColor(28, 28, 30))
 
-        # Thumbnail area
-        painter.fillRect(thumb_r, QColor(40, 40, 40))
-        pixmap: Optional[QPixmap] = index.data(_PIXMAP_ROLE)
+        # Rounded thumbnail background
+        thumb_path = QPainterPath()
+        thumb_path.addRoundedRect(QRectF(thumb_r), corner_r, corner_r)
+        painter.fillPath(thumb_path, QColor(44, 44, 46))
+
+        pixmap = index.data(_PIXMAP_ROLE)
         if pixmap:
+            rotation = (index.data(_META_ROLE) or {}).get("rotation", 0)
+            if rotation:
+                pixmap = pixmap.transformed(QTransform().rotate(rotation),
+                                            Qt.TransformationMode.SmoothTransformation)
+                pixmap = pixmap.scaled(THUMB_W, THUMB_H,
+                                       Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
             px = thumb_r.x() + (THUMB_W - pixmap.width()) // 2
             py = thumb_r.y() + (THUMB_H - pixmap.height()) // 2
+            painter.save()
+            painter.setClipPath(thumb_path)
             painter.drawPixmap(px, py, pixmap)
+            painter.restore()
 
         meta: dict = index.data(_META_ROLE) or {}
         rating = meta.get("rating", 0)
         color_label = meta.get("color_label")
         flag = meta.get("flag", "unflagged")
 
-        # Reject tint
         if flag == "reject":
-            painter.fillRect(thumb_r, QColor(180, 0, 0, 70))
+            painter.save()
+            painter.setClipPath(thumb_path)
+            painter.fillRect(thumb_r, QColor(255, 69, 58, 60))
+            painter.restore()
 
-        # Color label strip at bottom of thumbnail
         if color_label and color_label in COLOR_MAP:
             strip = QRect(thumb_r.x(), thumb_r.bottom() - 3, THUMB_W, 4)
+            painter.save()
+            painter.setClipPath(thumb_path)
             painter.fillRect(strip, COLOR_MAP[color_label])
+            painter.restore()
 
-        # Selection border
-        pen = QPen(QColor(255, 195, 30) if selected else QColor(55, 55, 55), 2)
+        # Rounded selection border
+        pen = QPen(QColor(10, 132, 255) if selected else QColor(58, 58, 60, 160), 2)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
-        painter.drawRect(thumb_r.adjusted(1, 1, -1, -1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        border_path = QPainterPath()
+        border_path.addRoundedRect(QRectF(thumb_r).adjusted(1, 1, -1, -1), corner_r, corner_r)
+        painter.drawPath(border_path)
 
-        # Bottom strip
-        painter.fillRect(bottom_r, QColor(18, 18, 18))
+        painter.fillRect(bottom_r, QColor(22, 22, 24))
 
         # Stars
         font = QFont()
         font.setPointSize(7)
         painter.setFont(font)
         for i in range(5):
-            painter.setPen(QColor(255, 195, 0) if i < rating else QColor(55, 55, 55))
+            painter.setPen(QColor(255, 214, 10) if i < rating else QColor(72, 72, 74))
             painter.drawText(bottom_r.x() + 2 + i * 13, bottom_r.bottom() - 3,
                              "★" if i < rating else "☆")
 
-        # Flag indicator
         if flag == "pick":
-            painter.setPen(QColor(52, 152, 219))
+            painter.setPen(QColor(48, 209, 88))
             flag_font = QFont()
             flag_font.setPointSize(7)
             flag_font.setBold(True)
             painter.setFont(flag_font)
             painter.drawText(bottom_r.right() - 14, bottom_r.bottom() - 3, "P")
         elif flag == "reject":
-            painter.setPen(QColor(231, 76, 60))
+            painter.setPen(QColor(255, 69, 58))
             flag_font = QFont()
             flag_font.setPointSize(7)
             flag_font.setBold(True)
@@ -126,11 +147,14 @@ class _Delegate(QStyledItemDelegate):
             banner_h = 13
             banner_r = QRect(thumb_r.x(), thumb_r.bottom() - banner_h - 4,
                              THUMB_W, banner_h)
-            painter.fillRect(banner_r, QColor(0, 0, 0, 160))
+            painter.save()
+            painter.setClipPath(thumb_path)
+            painter.fillRect(banner_r, QColor(0, 0, 0, 170))
+            painter.restore()
             sf_font = QFont()
             sf_font.setPointSize(6)
             painter.setFont(sf_font)
-            painter.setPen(QColor(220, 220, 220))
+            painter.setPen(QColor(235, 235, 245, 200))
             painter.drawText(banner_r.adjusted(3, 0, -2, 0),
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                              subfolder)
@@ -141,6 +165,7 @@ class _Delegate(QStyledItemDelegate):
 class FilmstripWidget(QListWidget):
     image_selected = pyqtSignal(int)     # current (viewer) row changed
     selection_changed = pyqtSignal(int)  # total selected count changed
+    load_progress = pyqtSignal(int, int)  # (loaded, total) for the queued batch
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -160,31 +185,39 @@ class FilmstripWidget(QListWidget):
 
         self.setStyleSheet("""
             QListWidget {
-                background: #161616;
+                background: #1C1C1E;
                 border: none;
-                border-top: 1px solid #333;
+                border-top: 1px solid #3A3A3C;
                 outline: none;
             }
-            QListWidget::item { background: #161616; }
+            QListWidget::item { background: #1C1C1E; }
             QScrollBar:horizontal {
-                background: #1e1e1e; height: 8px; margin: 0;
+                background: #2C2C2E; height: 8px; margin: 0;
             }
             QScrollBar::handle:horizontal {
-                background: #484848; border-radius: 4px; min-width: 30px;
+                background: #48484A; border-radius: 4px; min-width: 30px;
             }
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         """)
 
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(4)
+        self._pool.setMaxThreadCount(3)
         self._path_to_row: dict = {}
+        self._queued: set = set()
+        self._loaded_count = 0
         self._programmatic = False
 
+        self.horizontalScrollBar().valueChanged.connect(self._queue_visible_thumbs)
         self.currentRowChanged.connect(self._on_row_changed)
         self.itemSelectionChanged.connect(self._on_selection_changed)
 
     def load_images(self, paths: List[Path], metadata: MetadataStore,
                     root: Optional[Path] = None):
+        # Cancel any pending (not-yet-started) loads from a previous folder
+        self._pool.clear()
+        self._queued.clear()
+        self._loaded_count = 0
+
         self.blockSignals(True)
         self.clear()
         self._path_to_row.clear()
@@ -200,11 +233,50 @@ class FilmstripWidget(QListWidget):
             self.addItem(item)
             self._path_to_row[str(path)] = i
 
-            loader = _ThumbLoader(path)
+        self.blockSignals(False)
+        # Defer so layout settles before we hit-test for visible items
+        QTimer.singleShot(50, self._queue_visible_thumbs)
+
+    # ── lazy thumbnail loading ────────────────────────────────────────────────
+
+    _LOAD_BUFFER = 12  # items left/right of the visible range to pre-load
+
+    def _queue_visible_thumbs(self):
+        count = self.count()
+        if count == 0:
+            return
+        vr = self.viewport().rect()
+        left = self.indexAt(QPoint(vr.left() + 1, vr.center().y()))
+        right = self.indexAt(QPoint(vr.right() - 1, vr.center().y()))
+
+        left_col = left.row() if left.isValid() else 0
+        right_col = right.row() if right.isValid() else count - 1
+        if right_col < left_col:
+            right_col = count - 1
+
+        start = max(0, left_col - self._LOAD_BUFFER)
+        end = min(count - 1, right_col + self._LOAD_BUFFER)
+
+        for row in range(start, end + 1):
+            item = self.item(row)
+            if item is None:
+                continue
+            path_str = item.data(_PATH_ROLE)
+            if not path_str or path_str in self._queued:
+                continue
+            self._queued.add(path_str)
+            loader = _ThumbLoader(Path(path_str))
             loader.signals.loaded.connect(self._on_thumb_loaded)
             self._pool.start(loader)
+        self._emit_progress()
 
-        self.blockSignals(False)
+    def _emit_progress(self):
+        total = len(self._queued)
+        self.load_progress.emit(self._loaded_count, total)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._queue_visible_thumbs()
 
     def update_item_metadata(self, path: Path, metadata: MetadataStore):
         key = str(path)
@@ -225,8 +297,13 @@ class FilmstripWidget(QListWidget):
             if item:
                 item.setSelected(True)
             self._programmatic = False
+            # EnsureVisible (not PositionAtCenter): when the row is already
+            # visible — e.g. the user just clicked it — this does nothing, so the
+            # thumbnail stays put instead of snapping to center. Force-centering
+            # made clicks on near-identical consecutive frames look like the
+            # selection jumped a couple of items to the right.
             self.scrollToItem(self.currentItem(),
-                              QListWidget.ScrollHint.PositionAtCenter)
+                              QListWidget.ScrollHint.EnsureVisible)
             self.selection_changed.emit(1)
 
     def selected_paths(self) -> List[Path]:
@@ -241,6 +318,8 @@ class FilmstripWidget(QListWidget):
         self.selectAll()
 
     def _on_thumb_loaded(self, path_str: str, qimg: QImage):
+        self._loaded_count += 1
+        self._emit_progress()
         row = self._path_to_row.get(path_str)
         if row is None:
             return

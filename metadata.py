@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, Dict
 
-_DEFAULT: dict = {"rating": 0, "color_label": None, "flag": "unflagged"}
+_DEFAULT: dict = {"rating": 0, "color_label": None, "flag": "unflagged", "rotation": 0}
 
 _LABEL_TO_XMP: dict = {
     "red": "Red", "yellow": "Yellow", "green": "Green",
@@ -31,6 +31,9 @@ _XMP_TO_LABEL: dict = {v.lower(): k for k, v in _LABEL_TO_XMP.items()}
 _XMP_NS  = "http://ns.adobe.com/xap/1.0/"
 _RDF_NS  = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _LR_NS   = "http://ns.adobe.com/lightroom/1.0/"
+# Private namespace for app-only fields (a non-destructive display rotation that
+# is applied on top of the file's own EXIF orientation).
+_PS_NS   = "http://ns.photosort/1.0/"
 
 _JPEG_EXTS = {".jpg", ".jpeg"}
 _XMP_SIG   = b"http://ns.adobe.com/xap/1.0/\x00"
@@ -61,6 +64,9 @@ class MetadataStore:
     def get_flag(self, path: Path) -> str:
         return self.get(path).get("flag", "unflagged")
 
+    def get_rotation(self, path: Path) -> int:
+        return self.get(path).get("rotation", 0)
+
     def set_rating(self, path: Path, rating: int):
         entry = self.get(path)
         entry["rating"] = max(0, min(5, rating))
@@ -75,6 +81,16 @@ class MetadataStore:
         entry = self.get(path)
         entry["flag"] = flag
         self._update(path, entry)
+
+    def set_rotation(self, path: Path, degrees: int):
+        """Set absolute clockwise display rotation, normalised to 0/90/180/270."""
+        entry = self.get(path)
+        entry["rotation"] = round((degrees % 360) / 90) * 90 % 360
+        self._update(path, entry)
+
+    def rotate(self, path: Path, delta: int):
+        """Rotate by delta degrees clockwise (negative = counter-clockwise)."""
+        self.set_rotation(path, self.get_rotation(path) + delta)
 
     def remove(self, path: Path):
         """Clear metadata when an image is moved out of its folder."""
@@ -132,7 +148,8 @@ class MetadataStore:
     def _is_non_default(self, entry: dict) -> bool:
         return (entry.get("rating", 0) != 0
                 or entry.get("color_label") is not None
-                or entry.get("flag", "unflagged") != "unflagged")
+                or entry.get("flag", "unflagged") != "unflagged"
+                or entry.get("rotation", 0) != 0)
 
     def _read_jpeg_xmp(self, path: Path) -> dict:
         data = path.read_bytes()
@@ -155,6 +172,7 @@ class MetadataStore:
             r_str = desc.get(f"{{{_XMP_NS}}}Rating")
             l_str = desc.get(f"{{{_XMP_NS}}}Label", "")
             p_str = desc.get(f"{{{_LR_NS}}}pickStatus", "")
+            rot_str = desc.get(f"{{{_PS_NS}}}Rotation", "")
 
             for child in desc:
                 tag, text = child.tag, (child.text or "").strip()
@@ -166,6 +184,14 @@ class MetadataStore:
                     l_str = text
                 elif tag == f"{{{_LR_NS}}}pickStatus":
                     p_str = text
+                elif tag == f"{{{_PS_NS}}}Rotation":
+                    rot_str = text
+
+            if rot_str:
+                try:
+                    result["rotation"] = round((int(rot_str) % 360) / 90) * 90 % 360
+                except ValueError:
+                    pass
 
             if p_str:
                 try:
@@ -230,6 +256,7 @@ class MetadataStore:
         rating      = entry.get("rating", 0)
         color_label = entry.get("color_label")
         flag        = entry.get("flag", "unflagged")
+        rotation    = entry.get("rotation", 0)
 
         xmp_rating  = -1 if flag == "reject" else rating
         pick_status = {"pick": "1", "reject": "-1", "unflagged": "0"}[flag]
@@ -240,6 +267,8 @@ class MetadataStore:
             attrs.append(f'xmp:Label="{label_str}"')
         if flag != "unflagged":
             attrs.append(f'lr:pickStatus="{pick_status}"')
+        if rotation:
+            attrs.append(f'photosort:Rotation="{rotation}"')
 
         attrs_block = "\n      ".join(attrs)
 
@@ -251,6 +280,7 @@ class MetadataStore:
             '    <rdf:Description rdf:about=""\n'
             '      xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
             '      xmlns:lr="http://ns.adobe.com/lightroom/1.0/"\n'
+            '      xmlns:photosort="http://ns.photosort/1.0/"\n'
             f'      {attrs_block}/>\n'
             '  </rdf:RDF>\n'
             '</x:xmpmeta>\n'
